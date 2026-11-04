@@ -86,10 +86,12 @@ leash/
    pip install -r requirements.txt
    ```
 
-4. Configure environment variables (optional for development; defaults are provided):
+4. Configure environment variables (required for mandate signing):
    ```bash
    cp ../.env.example .env
    ```
+   Set `MANDATE_SIGNING_KEY` to a random secret of at least 32 bytes. The backend
+   will not start if the key is missing or too short.
 
 5. Run the development server:
    ```bash

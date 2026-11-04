@@ -39,6 +39,56 @@ def test_database_path_in_memory() -> None:
 
 
 @pytest.mark.asyncio
+async def test_init_db_applies_mandates_schema_version() -> None:
+    """Verify migration 2 creates the mandates table and records schema version 2."""
+    import aiosqlite
+
+    from app.db.database import get_db_path
+
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT MAX(version) FROM schema_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] >= 2
+
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mandates'"
+        )
+        table = await cursor.fetchone()
+        assert table is not None
+        assert table[0] == "mandates"
+
+
+@pytest.mark.asyncio
+async def test_save_mandate_does_not_overwrite_permissions() -> None:
+    """Verify ON CONFLICT updates keep permission columns immutable."""
+    from decimal import Decimal
+    from datetime import datetime, timedelta, timezone
+
+    from app.db.database import get_mandate_from_db, save_mandate_to_db
+    from app.schemas.mandate import MandateCreate
+    from app.services.mandate_service import create_draft_mandate
+
+    payload = MandateCreate(
+        max_total_budget=Decimal("40.00"),
+        currency="USD",
+        allowed_merchants=["amazon.com"],
+        allowed_categories=["books"],
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+    )
+    draft = await create_draft_mandate(payload)
+    draft.allowed_merchants = ["evil.com"]
+    draft.max_total_budget = Decimal("999.00")
+    await save_mandate_to_db(draft)
+
+    loaded = await get_mandate_from_db(draft.mandate_id)
+    assert loaded is not None
+    assert loaded.allowed_merchants == ["amazon.com"]
+    assert loaded.max_total_budget == Decimal("40.00")
+
+
+@pytest.mark.asyncio
 async def test_init_db_creates_parent_directory() -> None:
     """Verify init_db creates parent directories for subfolder database paths."""
     with tempfile.TemporaryDirectory() as tmpdir:

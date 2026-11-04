@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.api.v1.mandates import router as mandates_router
 from app.core.config import settings
 
 router = APIRouter()
@@ -15,3 +16,6 @@ async def status() -> dict[str, str]:
         "version": settings.APP_VERSION,
         "service": settings.APP_NAME,
     }
+
+
+router.include_router(mandates_router)

@@ -7,6 +7,8 @@ from typing import Any
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
+from app.core.security import validate_signing_secret
+
 # Directory paths for deterministic env file discovery
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -23,11 +25,16 @@ class Settings(BaseSettings):
     """
 
     APP_NAME: str = "LEASH"
-    APP_VERSION: str = "0.1.0"
+    APP_VERSION: str = "0.2.0-dev"
     DEBUG: bool = False
     DATABASE_URL: str = "sqlite:///./leash.db"
     CORS_ORIGINS: list[str] | str = ["http://localhost:5173"]
     API_V1_PREFIX: str = "/api/v1"
+
+    # Mandate signing key for HMAC-SHA256 (Phase 2A).
+    # Loaded only from the environment or .env — never a source-code default.
+    MANDATE_SIGNING_KEY: str = ""
+    MANDATE_KEY_ALGORITHM: str = "HMAC-SHA256"
 
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
@@ -59,6 +66,13 @@ class Settings(BaseSettings):
             return origins
 
         raise ValueError("Invalid type for CORS_ORIGINS")
+
+    @field_validator("MANDATE_SIGNING_KEY", mode="after")
+    @classmethod
+    def validate_mandate_signing_key(cls, v: str) -> str:
+        """Reject missing or weak mandate signing secrets at configuration load."""
+        validate_signing_secret(v)
+        return v
 
     model_config = {
         "env_file": (

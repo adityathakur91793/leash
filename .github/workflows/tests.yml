@@ -36,3 +36,4 @@ jobs:
           DATABASE_URL: "sqlite:///./test_leash.db"
           APP_NAME: "LEASH"
           DEBUG: "false"
+          MANDATE_SIGNING_KEY: "ci-test-signing-key-32-bytes-minimum-value!"

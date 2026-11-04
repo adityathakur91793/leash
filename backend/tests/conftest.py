@@ -4,15 +4,31 @@ import os
 import tempfile
 from collections.abc import AsyncIterator
 
-import pytest
+import aiosqlite
 import httpx
+import pytest
 
 # Point the database at a temporary file BEFORE importing the app so that
 # the Settings singleton picks up the override.
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmp_db.name}"
+os.environ.setdefault(
+    "MANDATE_SIGNING_KEY",
+    "leash-test-secret-signing-key-32-bytes-minimum!!",
+)
 
+from app.db.database import get_db_path, init_db  # noqa: E402
 from app.main import app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+async def init_test_db() -> AsyncIterator[None]:
+    """Ensure the temporary test database schema is initialized before tests run."""
+    await init_db()
+    yield
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute("DELETE FROM mandates")
+        await db.commit()
 
 
 @pytest.fixture

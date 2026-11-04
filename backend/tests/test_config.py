@@ -52,8 +52,30 @@ def test_cors_invalid_configuration(invalid_input: str) -> None:
         Settings(CORS_ORIGINS=invalid_input)
 
 
+def test_signing_key_rejected_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that Settings refuses to load without a mandate signing key."""
+    monkeypatch.delenv("MANDATE_SIGNING_KEY", raising=False)
+
+    class IsolatedSettings(Settings):
+        model_config = {"env_file": (), "extra": "ignore"}
+
+    with pytest.raises(ValidationError):
+        IsolatedSettings(_env_file=None)
+
+
+def test_signing_key_rejected_when_weak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that Settings rejects signing keys shorter than 32 bytes."""
+    monkeypatch.setenv("MANDATE_SIGNING_KEY", "too-short-secret")
+
+    class IsolatedSettings(Settings):
+        model_config = {"env_file": (), "extra": "ignore"}
+
+    with pytest.raises(ValidationError):
+        IsolatedSettings(_env_file=None)
+
+
 def test_env_file_precedence_and_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify that root .env is discovered, backend/.env overrides root, and env vars take top precedence."""
+    """Verify root .env discovery, backend/.env override, and env-var precedence."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_root = Path(tmpdir) / "project"
         tmp_backend = tmp_root / "backend"

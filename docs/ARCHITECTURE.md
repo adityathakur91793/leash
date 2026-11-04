@@ -14,30 +14,34 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 ├──────────────────────────────────────────────────┤
 │                    Backend                        │
 │              FastAPI (REST API)                   │
-│    Auth · Policy Engine · Audit · Payments        │
+│   Mandate Engine · Policy · Audit · Payments     │
 ├──────────────────────────────────────────────────┤
 │                   Data Layer                      │
 │     SQLite (dev) — extensible to PostgreSQL       │
-│   Policies · Audit Logs · Sessions · Mandates     │
+│   Mandates · Policies · Audit Logs · Sessions    │
 ├──────────────────────────────────────────────────┤
 │               External Services                   │
-│         PayPal API · Gemini AI · (future)          │
+│         PayPal API · Gemini AI · (future)         │
 └──────────────────────────────────────────────────┘
 ```
 
 ## Design Principles
-1. **Deny by default** — No purchase executes without an explicit matching policy.
-2. **Auditability** — Every agent action and policy decision is logged.
-3. **Separation of concerns** — AI reasoning, policy evaluation, and payment execution are independent modules.
-4. **Defense in depth** — Multiple validation layers prevent unauthorized purchases.
+1. **Deny by default** — No purchase executes without an explicit matching mandate and policy.
+2. **Deterministic authorization** — AI agents propose purchases, but deterministic code authorizes transactions.
+3. **Auditability & Integrity** — Every mandate is cryptographically signed and stored immutably.
+4. **Separation of concerns** — AI reasoning, mandate enforcement, and payment execution are strictly isolated.
 
 ## API Architecture
 - RESTful JSON API under `/api/v1/`.
-- Versioned endpoints to support backward compatibility.
-- Pydantic models for request/response validation.
+- Pydantic models with strict validation (`extra="forbid"`).
+- Exact Decimal monetary types and UTC timestamps.
 
-## Current State (Phase 1)
-- Health and status endpoints operational.
-- SQLite database initialization with schema versioning.
-- Frontend connectivity verification.
-- Foundation ready for Phase 2 feature implementation.
+## Current State (Phase 2A Complete)
+- Foundation operational (health and status probes).
+- SQLite database schema versioning (Version 2).
+- Mandate subsystem operational:
+  - Strict Pydantic validation (budget, currency, merchants, expiration).
+  - Deterministic canonical JSON serialization.
+  - Server-side HMAC-SHA256 mandate signing & constant-time verification.
+  - Lifecycle state machine (`DRAFT` → `CONFIRMED` → `SIGNED` → `ACTIVE`, plus `EXPIRED` & `REVOKED`).
+  - REST endpoints under `/api/v1/mandates`.
