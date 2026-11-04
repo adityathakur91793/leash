@@ -7,13 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.2.0-dev] — 2026-11-04
 
 ### Added
+- **Purchase Proposal Model (Phase 2B):** Strict Pydantic `ProposalCreate` /
+  `Proposal` schemas. A proposal is a purchase request, not an authorization or
+  payment instruction. Money uses `Decimal`; timestamps are timezone-aware UTC.
+- **Server-Side Totals:** Subtotal and total are recalculated by the backend.
+  Client totals and unexpected fields are rejected.
+- **Proposal Persistence:** Schema version 3 adds the `proposals` table with
+  foreign key to `mandates`, write-once commercial terms, content-hash
+  integrity, fingerprint uniqueness, and optional idempotency keys.
+- **Proposal REST API:** `POST /api/v1/proposals`, `GET /api/v1/proposals`, and
+  `GET /api/v1/proposals/{proposal_id}`.
+- **Proposal Tests:** Schema, service, API, persistence, duplicate, tamper, and
+  mandate-compatibility coverage.
 - **Mandate Data Model:** Strict Pydantic models (`MandateCreate`, `Mandate`, `MandateVerificationResponse`) utilizing `Decimal` for financial accuracy and timezone-aware UTC timestamps.
 - **Deterministic Canonical Serialization:** Canonical JSON serializer (`canonicalize_mandate_payload`) ensuring stable key ordering, sorted merchant/category lists, fixed Decimal formatting, and compact separators.
 - **Cryptographic Signing:** Server-side HMAC-SHA256 signing (`sign_payload`) and constant-time verification (`verify_signature`). The signing key is loaded only from environment configuration (no source-code default) and must be at least 32 bytes.
 - **Mandate Lifecycle Engine:** Deterministic state machine supporting `DRAFT` → `CONFIRMED` → `SIGNED` → `ACTIVE`, with terminal `EXPIRED` and `REVOKED` states.
 - **Database Schema Version 2:** SQLite migration adding the `mandates` table with immutable permissions enforcement on conflicts.
 - **Mandate REST API:** Endpoints under `/api/v1/mandates` for creating, confirming, signing, activating, verifying, revoking, and listing mandates.
-- **Test Suite Expansion:** Schema validation, signing/tamper resistance, lifecycle, API, persistence, and signing-key configuration tests (72 backend tests).
+- **Mandate Test Suite:** Schema validation, signing/tamper resistance, lifecycle, API, persistence, and signing-key configuration tests.
 
 ## [0.1.0] — 2026-11-03
 

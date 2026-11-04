@@ -1,6 +1,6 @@
 # LEASH Database Schema
 
-## Current Schema (Phase 2A — Version 2)
+## Current Schema (Phase 2B — Version 3)
 
 ### 1. `schema_version`
 Tracks database migration version history.
@@ -33,12 +33,40 @@ Stores user-granted purchase authorization mandates, cryptographic signatures, a
 | `signed_at`             | TEXT    | NULLABLE    | ISO 8601 UTC signing timestamp                               |
 | `signature_algorithm`   | TEXT    | NULLABLE    | Cryptographic signing algorithm (`HMAC-SHA256`)              |
 
+### 3. `proposals`
+Stores agent purchase *requests*. Rows are write-once for commercial terms.
+Status may later record evaluation outcome; it is not a payment order.
+
+| Column            | Type    | Constraints | Description                                              |
+|-------------------|---------|-------------|----------------------------------------------------------|
+| `proposal_id`     | TEXT    | PRIMARY KEY | Unique identifier prefix `prp_`                          |
+| `schema_version`  | TEXT    | NOT NULL    | Proposal specification version (e.g. `1.0`)              |
+| `status`          | TEXT    | NOT NULL    | `SUBMITTED`, `EVALUATED`, `APPROVED`, `REJECTED`, `WITHDRAWN` |
+| `mandate_id`      | TEXT    | NOT NULL, FK → `mandates.mandate_id` | Exactly one associated mandate |
+| `product_id`      | TEXT    | NOT NULL    | Opaque merchant product identifier                       |
+| `product_name`    | TEXT    | NOT NULL    | Untrusted product title (literal text only)              |
+| `merchant`        | TEXT    | NOT NULL    | Canonical merchant identifier                            |
+| `category`        | TEXT    | NOT NULL    | Normalized category tag                                  |
+| `quantity`        | INTEGER | NOT NULL    | Item quantity (1–10000)                                  |
+| `unit_price`      | TEXT    | NOT NULL    | Exact Decimal string                                     |
+| `currency`        | TEXT    | NOT NULL    | ISO 4217 code; must match mandate currency               |
+| `subtotal`        | TEXT    | NOT NULL    | Server-calculated `quantity * unit_price`                |
+| `tax`             | TEXT    | NOT NULL    | Tax amount (zero allowed)                                |
+| `shipping`        | TEXT    | NOT NULL    | Shipping amount (zero allowed)                           |
+| `other_charges`   | TEXT    | NOT NULL    | Additional charges (zero allowed)                        |
+| `total`           | TEXT    | NOT NULL    | Server-calculated `subtotal + tax + shipping + other_charges` |
+| `product_source`  | TEXT    | NOT NULL    | Untrusted catalog URL/reference; never fetched           |
+| `created_at`      | TEXT    | NOT NULL    | ISO 8601 UTC creation timestamp                          |
+| `idempotency_key` | TEXT    | NULLABLE, UNIQUE (partial) | Optional client duplicate key          |
+| `fingerprint`     | TEXT    | NOT NULL, UNIQUE | SHA-256 identity hash of commercial terms           |
+| `content_hash`    | TEXT    | NOT NULL    | SHA-256 integrity hash of canonical proposal JSON        |
+
+Migration 3 is additive: existing `mandates` rows and schema version 2 history
+are preserved. Foreign keys are enforced (`PRAGMA foreign_keys = ON`).
+
 ---
 
-## Planned Tables (Phase 2B+)
-
-### `purchase_requests`
-AI agent purchase attempts submitted for evaluation against active mandates.
+## Planned Tables (Phase 2C+)
 
 ### `policies`
 Standing user constraints and authorization policies.

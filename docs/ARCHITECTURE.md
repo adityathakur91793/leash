@@ -14,11 +14,11 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 ├──────────────────────────────────────────────────┤
 │                    Backend                        │
 │              FastAPI (REST API)                   │
-│   Mandate Engine · Policy · Audit · Payments     │
+│   Mandate Engine · Proposals · Policy · Payments │
 ├──────────────────────────────────────────────────┤
 │                   Data Layer                      │
 │     SQLite (dev) — extensible to PostgreSQL       │
-│   Mandates · Policies · Audit Logs · Sessions    │
+│   Mandates · Proposals · Policies · Audit Logs   │
 ├──────────────────────────────────────────────────┤
 │               External Services                   │
 │         PayPal API · Gemini AI · (future)         │
@@ -36,12 +36,18 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 - Pydantic models with strict validation (`extra="forbid"`).
 - Exact Decimal monetary types and UTC timestamps.
 
-## Current State (Phase 2A Complete)
+## Current State (Phase 2B Complete)
 - Foundation operational (health and status probes).
-- SQLite database schema versioning (Version 2).
+- SQLite database schema versioning (Version 3).
 - Mandate subsystem operational:
   - Strict Pydantic validation (budget, currency, merchants, expiration).
   - Deterministic canonical JSON serialization.
   - Server-side HMAC-SHA256 mandate signing & constant-time verification.
   - Lifecycle state machine (`DRAFT` → `CONFIRMED` → `SIGNED` → `ACTIVE`, plus `EXPIRED` & `REVOKED`).
   - REST endpoints under `/api/v1/mandates`.
+- Purchase proposal subsystem operational (request only — not authorization or payment):
+  - Strict Pydantic validation with server-calculated subtotal/total.
+  - One proposal : one mandate, matching currency, canonical merchant identity.
+  - Untrusted product fields stored as opaque text (never executed or fetched).
+  - Write-once commercial terms, duplicate protection via fingerprint and idempotency key.
+  - REST endpoints under `/api/v1/proposals` (create, get, list).

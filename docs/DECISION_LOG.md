@@ -23,3 +23,13 @@
 **Decision**: Use custom CSS for styling.
 **Rationale**: Avoids large dependency. Full control over design for hackathon demo. Keeps bundle small.
 **Trade-offs**: More manual styling work.
+
+## DL-005: Proposals are requests, not authorizations
+**Date**: 2026-11-04
+**Decision**: Phase 2B introduces a purchase proposal model that only creates,
+retrieves, and lists agent purchase requests.
+**Rationale**: Authorization must remain deterministic mandate/policy code, and
+payment must remain a later PayPal step. Mixing those into proposal creation
+would collapse the trust boundary.
+**Trade-offs**: Evaluation status exists on the model for later phases, but
+proposal APIs in 2B do not approve purchases or capture payment.

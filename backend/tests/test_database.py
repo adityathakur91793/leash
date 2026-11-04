@@ -61,6 +61,34 @@ async def test_init_db_applies_mandates_schema_version() -> None:
 
 
 @pytest.mark.asyncio
+async def test_init_db_applies_proposals_schema_version() -> None:
+    """Verify migration 3 creates the proposals table without dropping mandates."""
+    import aiosqlite
+
+    from app.db.database import get_db_path
+
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT MAX(version) FROM schema_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] >= 3
+
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='proposals'"
+        )
+        table = await cursor.fetchone()
+        assert table is not None
+        assert table[0] == "proposals"
+
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mandates'"
+        )
+        mandates = await cursor.fetchone()
+        assert mandates is not None
+
+
+@pytest.mark.asyncio
 async def test_save_mandate_does_not_overwrite_permissions() -> None:
     """Verify ON CONFLICT updates keep permission columns immutable."""
     from decimal import Decimal

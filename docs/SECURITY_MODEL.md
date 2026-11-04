@@ -37,6 +37,53 @@ To guarantee that cryptographic signatures are reproducible and tamper-evident:
 
 ---
 
+## Purchase Proposal Security (Phase 2B)
+
+A proposal is an agent-submitted purchase *request*. It is not a mandate, not an
+authorization decision, and not a payment instruction.
+
+### 1. Strict Input Validation
+- Pydantic `extra="forbid"` rejects unexpected fields, including client totals,
+  authorization flags, and payment tokens.
+- All money uses `Decimal` with at most two fractional digits. Unit price must
+  be strictly positive. Tax, shipping, and other charges may be zero but never
+  negative.
+- Quantity is an integer in `[1, 10000]`.
+- Currency must be a supported uppercase ISO 4217 code and must match the
+  associated mandate currency.
+
+### 2. Server-Side Totals
+Subtotal (`quantity * unit_price`) and total
+(`subtotal + tax + shipping + other_charges`) are always recalculated by the
+server. Client-calculated totals are not accepted on create.
+
+### 3. Untrusted Product Content
+Product names, identifiers, categories, and source/reference strings are treated
+as opaque untrusted data:
+- Control characters are rejected.
+- Values are stored and returned as literal text.
+- LEASH never executes, evaluates, or fetches product content as instructions
+  or code.
+
+### 4. Mandate Binding and Merchant Identity
+- Each proposal references exactly one existing `mandate_id` (foreign key).
+- Merchant identifiers are canonicalized with the same domain rules as mandates.
+
+### 5. Immutability, Integrity, and Duplicates
+- Commercial terms are insert-only. Status transitions never rewrite prices,
+  quantities, or merchants. Changed terms require a **new** proposal.
+- A SHA-256 `content_hash` of canonical proposal JSON is verified on read.
+- Duplicate protection uses a stable commercial-term `fingerprint` plus an
+  optional `idempotency_key`. Replaying the same request returns the original
+  proposal. Reusing an idempotency key with different terms is rejected.
+
+### 6. Separation from Authorization and Payment
+Proposal create/get/list do not sign mandates, do not evaluate policy, and do
+not call PayPal. An `APPROVED` status (later phases) remains a recorded
+evaluation outcome, not a payment execution.
+
+---
+
 ## Threat Model & Mitigations
 
 | Threat Vector | Mitigation Strategy |
@@ -48,3 +95,8 @@ To guarantee that cryptographic signatures are reproducible and tamper-evident:
 | **Replay / Zombie Mandates** | Mandatory `expires_at` UTC timestamp checked on every verification. |
 | **Signature Forgery / Key Tampering** | Server rejects weak keys (< 32 bytes). Signature comparison uses constant-time checks. Raw keys are never stored in SQLite or exposed to frontend code. |
 | **In-Flight Data Tampering** | Any payload modification invalidates the HMAC signature. |
+| **Agent-supplied fake totals** | Server recalculates subtotal and total; extra total fields are forbidden. |
+| **Prompt-like product copy** | Product fields are opaque text with control characters stripped/rejected; never executed. |
+| **Proposal replay / duplicate spend request** | Fingerprint uniqueness and optional idempotency keys return the original proposal. |
+| **In-place proposal mutation** | Commercial columns are write-once; content hash verification detects storage tampering. |
+| **Proposal without mandate** | Foreign key plus explicit existence check; missing mandate returns 404. |

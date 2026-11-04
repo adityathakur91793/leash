@@ -164,13 +164,100 @@ When invalid:
 
 ---
 
-## Phase 2B+ Endpoints (Planned)
+## Phase 2B Purchase Proposal Endpoints
 
-### POST /api/v1/agent/purchase-request
-Submit a purchase request from an AI agent against an active mandate.
+A proposal is a purchase *request*. Creating or retrieving a proposal does not
+authorize a purchase and does not execute payment.
+
+### POST /api/v1/proposals
+Submit a purchase proposal associated with exactly one existing mandate.
+
+Subtotal and total are calculated server-side. Client-supplied totals, payment
+fields, and unknown properties are rejected (`extra="forbid"`).
+
+**Request Body**
+```json
+{
+  "mandate_id": "man_a1b2c3d4e5f67890",
+  "product_id": "sku-100",
+  "product_name": "Hardcover Notebook",
+  "merchant": "amazon.com",
+  "category": "books",
+  "quantity": 1,
+  "unit_price": "12.50",
+  "currency": "USD",
+  "tax": "1.00",
+  "shipping": "2.00",
+  "other_charges": "0.50",
+  "product_source": "https://amazon.com/dp/sku-100",
+  "idempotency_key": "agent-req-0001"
+}
+```
+
+**Response** `201 Created` (new proposal) or `200 OK` (idempotent replay)
+```json
+{
+  "proposal_id": "prp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "schema_version": "1.0",
+  "status": "SUBMITTED",
+  "mandate_id": "man_a1b2c3d4e5f67890",
+  "product_id": "sku-100",
+  "product_name": "Hardcover Notebook",
+  "merchant": "amazon.com",
+  "category": "books",
+  "quantity": 1,
+  "unit_price": "12.50",
+  "currency": "USD",
+  "subtotal": "12.50",
+  "tax": "1.00",
+  "shipping": "2.00",
+  "other_charges": "0.50",
+  "total": "16.00",
+  "product_source": "https://amazon.com/dp/sku-100",
+  "created_at": "2026-11-04T00:00:00+00:00",
+  "idempotency_key": "agent-req-0001",
+  "fingerprint": "…64-char sha256 hex…",
+  "content_hash": "…64-char sha256 hex…"
+}
+```
+
+**Errors**
+- `404 Not Found` if the associated mandate does not exist.
+- `409 Conflict` if `idempotency_key` is reused with different commercial terms.
+- `422 Unprocessable Entity` for invalid money/quantity/currency/merchant values
+  or when proposal currency does not match the mandate currency.
+
+### GET /api/v1/proposals
+List recent proposals.
+
+**Query Parameters**
+- `limit` (integer, default: 50, min: 1, max: 100)
+- `mandate_id` (optional string) — restrict results to one mandate
+
+**Response** `200 OK` (array of `Proposal` objects)
+**Error:** `404 Not Found` if `mandate_id` is supplied and does not exist.
+**Error:** `422 Unprocessable Entity` if a stored proposal fails integrity checks.
+
+### GET /api/v1/proposals/{proposal_id}
+Retrieve a proposal after content-hash verification.
+
+- **Response:** `200 OK` (full `Proposal` object)
+- **Error:** `404 Not Found` if the proposal does not exist.
+- **Error:** `422 Unprocessable Entity` if stored terms do not match `content_hash`.
+
+Proposal commercial terms are immutable after insert. Changed baskets require a
+new proposal (and a new idempotency key when one is used). Evaluation/approval
+status is recorded separately in later phases and is not a payment instruction.
+
+---
+
+## Phase 2C+ Endpoints (Planned)
 
 ### POST /api/v1/policies
-User-level policy configuration.
+User-level policy configuration and evaluation against an active mandate.
 
 ### GET /api/v1/audit/logs
 Retrieve immutable audit logs.
+
+### Payment execution
+PayPal capture remains out of band from proposal creation.

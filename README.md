@@ -103,6 +103,8 @@ leash/
    curl http://localhost:8000/health
    curl http://localhost:8000/api/v1/status
    ```
+   Mandate APIs live at `/api/v1/mandates`. Purchase proposals (request only,
+   not payment) live at `/api/v1/proposals`.
 
 ### Running Backend Tests
 
