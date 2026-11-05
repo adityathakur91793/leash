@@ -135,7 +135,8 @@ async def test_int_03_hard_block_overrides_soft() -> None:
     # Currency mismatch is a hard block
     proposal, _ = await create_proposal(_make_proposal_payload(mandate.mandate_id))
 
-    # Artificially alter proposal currency to trigger P08 hard block while P05 unlisted merchant is soft
+    # Artificially alter proposal currency to trigger P08 hard block
+    # while P05 unlisted merchant is soft
     proposal_dict = proposal.model_dump()
     proposal_dict["currency"] = "EUR"
     proposal_dict["merchant"] = "target.com"  # soft exception
@@ -176,7 +177,8 @@ async def test_int_05_approval_token_verification(base_now: datetime) -> None:
     proposal_id = "prp_test_token"
     content_hash = "hash_123456"
     session_id = "user_sess_789"
-    token = generate_approval_token(proposal_id, content_hash, session_id, base_now)
+    nonce = "nonce_int_05_test"
+    token = generate_approval_token(proposal_id, content_hash, session_id, base_now, nonce=nonce)
 
     valid, reason = verify_approval_token(
         token=token,
@@ -184,6 +186,7 @@ async def test_int_05_approval_token_verification(base_now: datetime) -> None:
         content_hash=content_hash,
         user_session_id=session_id,
         approval_timestamp=base_now,
+        nonce=nonce,
         now=base_now + timedelta(minutes=5),
     )
     assert valid is True
@@ -195,7 +198,8 @@ async def test_int_06_approval_token_rejected_after_modification(base_now: datet
     proposal_id = "prp_test_token"
     content_hash = "hash_original"
     session_id = "user_sess_789"
-    token = generate_approval_token(proposal_id, content_hash, session_id, base_now)
+    nonce = "nonce_int_06_test"
+    token = generate_approval_token(proposal_id, content_hash, session_id, base_now, nonce=nonce)
 
     # Content hash changed because terms modified
     valid, reason = verify_approval_token(
@@ -204,6 +208,7 @@ async def test_int_06_approval_token_rejected_after_modification(base_now: datet
         content_hash="hash_modified",
         user_session_id=session_id,
         approval_timestamp=base_now,
+        nonce=nonce,
         now=base_now + timedelta(minutes=5),
     )
     assert valid is False
@@ -215,7 +220,8 @@ async def test_int_07_expired_approval_token(base_now: datetime) -> None:
     proposal_id = "prp_test_token"
     content_hash = "hash_123"
     session_id = "user_sess_789"
-    token = generate_approval_token(proposal_id, content_hash, session_id, base_now)
+    nonce = "nonce_int_07_test"
+    token = generate_approval_token(proposal_id, content_hash, session_id, base_now, nonce=nonce)
 
     valid, reason = verify_approval_token(
         token=token,
@@ -223,6 +229,7 @@ async def test_int_07_expired_approval_token(base_now: datetime) -> None:
         content_hash=content_hash,
         user_session_id=session_id,
         approval_timestamp=base_now,
+        nonce=nonce,
         now=base_now + timedelta(minutes=16),  # Exceeds 15m TTL
     )
     assert valid is False
@@ -481,11 +488,13 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
     proposal, _ = await create_proposal(_make_proposal_payload(mandate.mandate_id))
 
     now = datetime.now(timezone.utc)
+    nonce = "nonce_rem_single_use"
     token = generate_approval_token(
         proposal_id=proposal.proposal_id,
         content_hash=proposal.content_hash,
         user_session_id="user_sess_123",
         approval_timestamp=now,
+        nonce=nonce,
     )
 
     # Pre-register token
@@ -503,6 +512,7 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
         content_hash=proposal.content_hash,
         user_session_id="user_sess_123",
         approval_timestamp=now,
+        nonce=nonce,
         now=now,
     )
     assert success is True
@@ -515,6 +525,7 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
         content_hash=proposal.content_hash,
         user_session_id="user_sess_123",
         approval_timestamp=now,
+        nonce=nonce,
         now=now + timedelta(seconds=1),
     )
     assert success_replay is False
@@ -529,11 +540,13 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
     )
 
     now = datetime.now(timezone.utc)
+    nonce = "nonce_rem_concurrent"
     token = generate_approval_token(
         proposal_id=proposal.proposal_id,
         content_hash=proposal.content_hash,
         user_session_id="sess_conc_456",
         approval_timestamp=now,
+        nonce=nonce,
     )
 
     # Two concurrent requests presenting the same approval token
@@ -544,6 +557,7 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
             content_hash=proposal.content_hash,
             user_session_id="sess_conc_456",
             approval_timestamp=now,
+            nonce=nonce,
             now=now,
         ),
         verify_and_consume_approval_token(
@@ -552,6 +566,7 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
             content_hash=proposal.content_hash,
             user_session_id="sess_conc_456",
             approval_timestamp=now,
+            nonce=nonce,
             now=now,
         ),
     )

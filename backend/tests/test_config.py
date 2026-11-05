@@ -74,6 +74,51 @@ def test_signing_key_rejected_when_weak(monkeypatch: pytest.MonkeyPatch) -> None
         IsolatedSettings(_env_file=None)
 
 
+def test_admin_api_key_rejected_when_missing_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that Settings refuses to load in production (DEBUG=False) without ADMIN_API_KEY."""
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    monkeypatch.setenv("MANDATE_SIGNING_KEY", "a" * 32)
+
+    class IsolatedSettings(Settings):
+        model_config = {"env_file": (), "extra": "ignore"}
+
+    with pytest.raises(ValidationError) as exc:
+        IsolatedSettings(_env_file=None, DEBUG=False)
+    assert "ADMIN_API_KEY must be configured with at least 32 characters" in str(exc.value)
+
+
+def test_admin_api_key_rejected_when_weak_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that Settings rejects ADMIN_API_KEY shorter than 32 characters in production."""
+    monkeypatch.setenv("ADMIN_API_KEY", "too-short-admin-key")
+    monkeypatch.setenv("MANDATE_SIGNING_KEY", "a" * 32)
+
+    class IsolatedSettings(Settings):
+        model_config = {"env_file": (), "extra": "ignore"}
+
+    with pytest.raises(ValidationError) as exc:
+        IsolatedSettings(_env_file=None, DEBUG=False)
+    assert "ADMIN_API_KEY must be configured with at least 32 characters" in str(exc.value)
+
+
+def test_admin_api_key_allowed_missing_when_debug_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that Settings permits empty ADMIN_API_KEY when DEBUG=True (dev mode)."""
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    monkeypatch.setenv("MANDATE_SIGNING_KEY", "a" * 32)
+
+    class IsolatedSettings(Settings):
+        model_config = {"env_file": (), "extra": "ignore"}
+
+    s = IsolatedSettings(_env_file=None, DEBUG=True, ADMIN_API_KEY="")
+    assert s.DEBUG is True
+    assert s.ADMIN_API_KEY == ""
+
+
 def test_env_file_precedence_and_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify root .env discovery, backend/.env override, and env-var precedence."""
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -1,5 +1,6 @@
 """Mandate service for lifecycle transitions, signing, and verification."""
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -13,16 +14,20 @@ from app.core.security import (
     verify_signature,
 )
 from app.db.database import (
+    get_connection,
     get_mandate_from_db,
     list_mandates_from_db,
     save_mandate_to_db,
 )
+from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.mandate import (
     Mandate,
     MandateCreate,
     MandateStatus,
     MandateVerificationResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MandateNotFoundError(Exception):
@@ -79,7 +84,30 @@ async def create_draft_mandate(data: MandateCreate) -> Mandate:
         signature_algorithm=None,
     )
 
-    await save_mandate_to_db(mandate)
+    # Atomically persist draft mandate and audit record within one transaction
+    async with get_connection() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await save_mandate_to_db(mandate, db=conn)
+            from app.services.audit_service import AuditService  # noqa: PLC0415
+
+            await AuditService.append_event(
+                event_type=AuditEventType.MANDATE_CREATED,
+                entity_type=AuditEntityType.MANDATE,
+                entity_id=mandate.mandate_id,
+                actor=AuditActor.USER,
+                payload={
+                    "currency": mandate.currency,
+                    "mandate_id": mandate.mandate_id,
+                    "status": mandate.status.value,
+                },
+                db=conn,
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
     return mandate
 
 
@@ -144,7 +172,29 @@ async def sign_mandate(mandate_id: str, secret: str | None = None) -> Mandate:
     mandate.signed_at = now
     mandate.signature_algorithm = settings.MANDATE_KEY_ALGORITHM
 
-    await save_mandate_to_db(mandate)
+    # Atomically persist signed mandate and audit record within one transaction
+    async with get_connection() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await save_mandate_to_db(mandate, db=conn)
+            from app.services.audit_service import AuditService  # noqa: PLC0415
+
+            await AuditService.append_event(
+                event_type=AuditEventType.MANDATE_SIGNED,
+                entity_type=AuditEntityType.MANDATE,
+                entity_id=mandate.mandate_id,
+                actor=AuditActor.USER,
+                payload={
+                    "mandate_id": mandate.mandate_id,
+                    "signature_algorithm": mandate.signature_algorithm or "HMAC-SHA256",
+                },
+                db=conn,
+            )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
     return mandate
 
 

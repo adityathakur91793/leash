@@ -89,6 +89,28 @@ async def test_init_db_applies_proposals_schema_version() -> None:
 
 
 @pytest.mark.asyncio
+async def test_init_db_applies_audit_logs_schema_version() -> None:
+    """Verify migration 5 creates audit_logs, audit_checkpoints, and system_controls."""
+    import aiosqlite
+
+    from app.db.database import get_db_path
+
+    db_path = get_db_path()
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("SELECT MAX(version) FROM schema_version")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] >= 5
+
+        for table in ("audit_logs", "audit_checkpoints", "system_controls"):
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            res = await cursor.fetchone()
+            assert res is not None, f"Table {table} must be created in migration 5."
+
+
+@pytest.mark.asyncio
 async def test_save_mandate_does_not_overwrite_permissions() -> None:
     """Verify ON CONFLICT updates keep permission columns immutable."""
     from decimal import Decimal

@@ -16,6 +16,10 @@ os.environ.setdefault(
     "MANDATE_SIGNING_KEY",
     "leash-test-secret-signing-key-32-bytes-minimum!!",
 )
+os.environ.setdefault(
+    "ADMIN_API_KEY",
+    "leash-test-admin-key-32-bytes-minimum-secret!!",
+)
 
 from app.db.database import get_db_path, init_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -28,9 +32,18 @@ async def init_test_db() -> AsyncIterator[None]:
     yield
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM audit_checkpoints")
+        await db.execute("DELETE FROM audit_logs")
         await db.execute("DELETE FROM approval_tokens")
         await db.execute("DELETE FROM proposals")
         await db.execute("DELETE FROM mandates")
+        await db.execute(
+            """
+            UPDATE system_controls
+            SET kill_switch_active = 0, engaged_at = NULL, engaged_by = NULL, reason = NULL
+            WHERE control_id = 1
+            """
+        )
         await db.commit()
 
 

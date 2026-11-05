@@ -7,6 +7,7 @@ LLMs, external APIs, or executing payments.
 import hashlib
 import hmac
 import ipaddress
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -1179,28 +1180,77 @@ def evaluate_policy(
     )
 
 
+def canonicalize_approval_payload(
+    proposal_id: str,
+    content_hash: str,
+    user_session_id: str,
+    approval_timestamp: datetime,
+    expires_at: datetime,
+    nonce: str,
+) -> str:
+    """Serialize approval token parameters into deterministic canonical JSON.
+
+    Adheres to the Restricted Deterministic JSON Profile:
+    - Rejects missing, empty, or whitespace-only nonce.
+    - Deterministically formats UTC timestamps to ISO-8601.
+    - Keys are sorted lexicographically with compact separators.
+    """
+    if not isinstance(nonce, str) or not nonce.strip():
+        raise ValueError("nonce is mandatory and must be a non-empty string.")
+    if not isinstance(proposal_id, str) or not proposal_id.strip():
+        raise ValueError("proposal_id is mandatory and must be a non-empty string.")
+    if not isinstance(content_hash, str) or not content_hash.strip():
+        raise ValueError("content_hash is mandatory and must be a non-empty string.")
+    if not isinstance(user_session_id, str) or not user_session_id.strip():
+        raise ValueError("user_session_id is mandatory and must be a non-empty string.")
+
+    ts_iso = approval_timestamp.astimezone(timezone.utc).isoformat()
+    exp_iso = expires_at.astimezone(timezone.utc).isoformat()
+
+    envelope = {
+        "content_hash": content_hash.strip(),
+        "expires_at": exp_iso,
+        "issued_at": ts_iso,
+        "nonce": nonce.strip(),
+        "proposal_id": proposal_id.strip(),
+        "user_session_id": user_session_id.strip(),
+    }
+    return json.dumps(
+        envelope,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def generate_approval_token(
     proposal_id: str,
     content_hash: str,
     user_session_id: str,
     approval_timestamp: datetime,
+    nonce: str,
+    expires_at: datetime | None = None,
     secret_key: str | None = None,
+    ttl_seconds: int = 900,
 ) -> str:
     """Generate cryptographically bound single-use user approval token.
 
-    Args:
-        proposal_id: Identifier of the approved proposal.
-        content_hash: SHA-256 hash of immutable commercial terms.
-        user_session_id: Authenticated user identifier or session token.
-        approval_timestamp: Timezone-aware UTC timestamp when approval occurred.
-        secret_key: Key for HMAC signing (defaults to MANDATE_SIGNING_KEY).
-
-    Returns:
-        Hex-encoded HMAC-SHA256 signature string.
+    Binds nonce, proposal ID, content hash, user session, and UTC issuance/expiry.
     """
     key = secret_key or settings.MANDATE_SIGNING_KEY
-    ts_iso = approval_timestamp.astimezone(timezone.utc).isoformat()
-    payload = f"{proposal_id}:{content_hash}:{user_session_id}:{ts_iso}"
+    if not key:
+        raise ValueError("Mandate signing key is required for approval tokens.")
+    if expires_at is None:
+        expires_at = approval_timestamp.astimezone(timezone.utc) + timedelta(seconds=ttl_seconds)
+
+    payload = canonicalize_approval_payload(
+        proposal_id=proposal_id,
+        content_hash=content_hash,
+        user_session_id=user_session_id,
+        approval_timestamp=approval_timestamp,
+        expires_at=expires_at,
+        nonce=nonce,
+    )
     return hmac.new(key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -1210,44 +1260,49 @@ def verify_approval_token(
     content_hash: str,
     user_session_id: str,
     approval_timestamp: datetime,
+    nonce: str,
     now: datetime,
-    ttl_seconds: int = 900,  # 15 minutes default TTL
+    expires_at: datetime | None = None,
+    ttl_seconds: int = 900,
     secret_key: str | None = None,
 ) -> tuple[bool, str]:
-    """Verify approval token is cryptographically valid and not expired.
-
-    Args:
-        token: Hex HMAC token to verify.
-        proposal_id: Target proposal ID.
-        content_hash: Current proposal content hash.
-        user_session_id: Session ID that signed approval.
-        approval_timestamp: Timestamp when token was created.
-        now: Current evaluation UTC timestamp.
-        ttl_seconds: Time-to-live window in seconds.
-        secret_key: Key for HMAC verification.
-
-    Returns:
-        Tuple of (is_valid, reason).
-    """
+    """Verify approval token is cryptographically valid, not expired, and correctly bound."""
     if not token or not isinstance(token, str):
         return False, "Approval token is missing or empty."
+    if not nonce or not isinstance(nonce, str) or not nonce.strip():
+        return False, "Approval token nonce is missing or empty."
 
     appr_utc = approval_timestamp.astimezone(timezone.utc)
     now_utc = now.astimezone(timezone.utc)
 
+    if expires_at is None:
+        expires_at = appr_utc + timedelta(seconds=ttl_seconds)
+    else:
+        expires_at = expires_at.astimezone(timezone.utc)
+
     age_seconds = (now_utc - appr_utc).total_seconds()
     if age_seconds < 0:
         return False, "Approval token timestamp is in the future."
-    if age_seconds > ttl_seconds:
+    if now_utc > expires_at:
         return False, f"Approval token has expired ({age_seconds:.0f}s > {ttl_seconds}s TTL)."
 
-    expected = generate_approval_token(
-        proposal_id=proposal_id,
-        content_hash=content_hash,
-        user_session_id=user_session_id,
-        approval_timestamp=approval_timestamp,
-        secret_key=secret_key,
-    )
+    key = secret_key or settings.MANDATE_SIGNING_KEY
+    if not key:
+        return False, "Mandate signing key is required for approval token verification."
+
+    try:
+        expected = generate_approval_token(
+            proposal_id=proposal_id,
+            content_hash=content_hash,
+            user_session_id=user_session_id,
+            approval_timestamp=approval_timestamp,
+            nonce=nonce,
+            expires_at=expires_at,
+            secret_key=key,
+            ttl_seconds=ttl_seconds,
+        )
+    except ValueError as exc:
+        return False, f"Token generation validation error: {exc}"
 
     if not hmac.compare_digest(expected, token):
         return False, "Approval token verification failed (mismatch or terms modified)."
@@ -1282,7 +1337,9 @@ async def verify_and_consume_approval_token(
     content_hash: str,
     user_session_id: str,
     approval_timestamp: datetime,
+    nonce: str,
     now: datetime,
+    expires_at: datetime | None = None,
     ttl_seconds: int = 900,
     secret_key: str | None = None,
     db: aiosqlite.Connection | None = None,
@@ -1290,10 +1347,11 @@ async def verify_and_consume_approval_token(
     """Verify approval token cryptographically and atomically consume it in database.
 
     Enforces:
-    1. Cryptographic HMAC-SHA256 signature validity.
-    2. Exact proposal binding and un-tampered commercial terms (content_hash).
-    3. Expiry check against TTL.
-    4. Atomic single-use consumption in SQLite (prevents concurrent replay).
+    1. Cryptographic HMAC-SHA256 signature validity over canonical JSON.
+    2. Mandatory nonce binding.
+    3. Exact proposal binding and un-tampered commercial terms (content_hash).
+    4. Expiry check against TTL and UTC issuance timestamp.
+    5. Atomic single-use consumption in SQLite (prevents concurrent replay).
     """
     is_valid, reason = verify_approval_token(
         token=token,
@@ -1301,7 +1359,9 @@ async def verify_and_consume_approval_token(
         content_hash=content_hash,
         user_session_id=user_session_id,
         approval_timestamp=approval_timestamp,
+        nonce=nonce,
         now=now,
+        expires_at=expires_at,
         ttl_seconds=ttl_seconds,
         secret_key=secret_key,
     )

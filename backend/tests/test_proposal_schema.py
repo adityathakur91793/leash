@@ -6,7 +6,12 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.proposal import Proposal, ProposalCreate, ProposalStatus, build_proposal_from_create
+from app.schemas.proposal import (
+    Proposal,
+    ProposalCreate,
+    ProposalStatus,
+    build_proposal_from_create,
+)
 
 
 def _valid_create_data() -> dict:

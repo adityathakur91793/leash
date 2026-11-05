@@ -8,11 +8,19 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
 from app.core.config import BACKEND_DIR, settings
 from app.core.security import proposal_content_hash
+from app.schemas.audit import (
+    AuditCheckpoint,
+    AuditLogEntry,
+    canonical_audit_hash,
+    sign_checkpoint,
+)
+from app.schemas.kill_switch import KillSwitchStatus
 from app.schemas.mandate import Mandate, MandateStatus
 from app.schemas.proposal import Proposal, ProposalStatus
 
@@ -191,6 +199,193 @@ async def init_db() -> None:
             )
             current_version = 4
             logger.info("Applied migration version 4 (approval_tokens)")
+
+        # Migration 5: Audit logs, checkpoints, and system controls (Phase 2D.1)
+        if current_version < 5:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    sequence_number  INTEGER PRIMARY KEY,
+                    timestamp        TEXT    NOT NULL,
+                    event_type       TEXT    NOT NULL,
+                    entity_type      TEXT    NOT NULL,
+                    entity_id        TEXT    NOT NULL,
+                    actor            TEXT    NOT NULL,
+                    payload_json     TEXT    NOT NULL,
+                    prev_hash        TEXT    NOT NULL,
+                    entry_hash       TEXT    NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_logs_entity "
+                "ON audit_logs(entity_type, entity_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type "
+                "ON audit_logs(event_type)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp "
+                "ON audit_logs(timestamp)"
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_checkpoints (
+                    checkpoint_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sequence_number  INTEGER NOT NULL,
+                    entry_hash       TEXT    NOT NULL,
+                    sealed_at        TEXT    NOT NULL,
+                    sealed_by        TEXT    NOT NULL,
+                    checkpoint_sig   TEXT    NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_checkpoints_seq "
+                "ON audit_checkpoints(sequence_number)"
+            )
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_controls (
+                    control_id         INTEGER PRIMARY KEY CHECK (control_id = 1),
+                    kill_switch_active INTEGER NOT NULL DEFAULT 0,
+                    engaged_at         TEXT,
+                    engaged_by         TEXT,
+                    reason             TEXT,
+                    updated_at         TEXT    NOT NULL
+                )
+                """
+            )
+            now_utc_str = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO system_controls (
+                    control_id, kill_switch_active, engaged_at, engaged_by, reason, updated_at
+                ) VALUES (1, 0, NULL, NULL, NULL, ?)
+                """,
+                (now_utc_str,),
+            )
+
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (5, datetime('now'))"
+            )
+            current_version = 5
+            logger.info(
+                "Applied migration version 5 (audit_logs, audit_checkpoints, system_controls)"
+            )
+
+        # Ensure Genesis Audit Log & Checkpoint exist whenever audit_logs is empty
+        if current_version >= 5:
+            # Enforce UNIQUE constraint on audit_checkpoints.sequence_number.
+            # Migration 5 may have been applied with only a non-unique index on
+            # already-running databases. We upgrade it here idempotently.
+            # Step 1: Check for duplicate sequence_number rows (should never exist,
+            # but we refuse to silently delete records if they somehow do).
+            dup_cursor = await db.execute(
+                """
+                SELECT sequence_number, COUNT(*) AS cnt
+                FROM audit_checkpoints
+                GROUP BY sequence_number
+                HAVING cnt > 1
+                """
+            )
+            duplicates = await dup_cursor.fetchall()
+            if duplicates:
+                dup_info = ", ".join(
+                    f"seq={r[0]} (count={r[1]})" for r in duplicates
+                )
+                raise RuntimeError(
+                    "CRITICAL: Duplicate sequence_number rows detected in "
+                    f"audit_checkpoints: {dup_info}. "
+                    "Data integrity violation — refusing to apply UNIQUE constraint. "
+                    "Investigate and resolve duplicates manually before restarting."
+                )
+            # Step 2: Drop the old non-unique index if it still exists, then
+            # create the enforced UNIQUE index. Both ops are idempotent.
+            existing = await db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND name='idx_audit_checkpoints_seq'"
+            )
+            idx_row = await existing.fetchone()
+            if idx_row is not None:
+                idx_info = await db.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='index' AND name='idx_audit_checkpoints_seq'"
+                )
+                idx_sql_row = await idx_info.fetchone()
+                idx_sql = idx_sql_row[0] if idx_sql_row else ""
+                if idx_sql and "UNIQUE" not in idx_sql.upper():
+                    await db.execute("DROP INDEX idx_audit_checkpoints_seq")
+                    logger.info(
+                        "Dropped non-unique idx_audit_checkpoints_seq; "
+                        "recreating as UNIQUE"
+                    )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_checkpoints_seq "
+                "ON audit_checkpoints(sequence_number)"
+            )
+
+            cursor = await db.execute("SELECT COUNT(*) FROM audit_logs")
+            count = (await cursor.fetchone())[0]
+            if count == 0:
+                genesis_now = datetime.now(timezone.utc)
+                genesis_ts = genesis_now.isoformat()
+                genesis_prev_hash = "0" * 64
+                genesis_payload = {"message": "LEASH audit logging subsystem initialized."}
+                genesis_envelope = {
+                    "actor": "SYSTEM",
+                    "entity_id": "system",
+                    "entity_type": "SYSTEM",
+                    "event_type": "GENESIS",
+                    "payload": genesis_payload,
+                    "prev_hash": genesis_prev_hash,
+                    "sequence_number": 1,
+                    "timestamp": genesis_ts,
+                }
+                genesis_entry_hash = canonical_audit_hash(genesis_envelope)
+                await db.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        sequence_number, timestamp, event_type, entity_type,
+                        entity_id, actor, payload_json, prev_hash, entry_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        1,
+                        genesis_ts,
+                        "GENESIS",
+                        "SYSTEM",
+                        "system",
+                        "SYSTEM",
+                        json.dumps(genesis_payload, sort_keys=True, separators=(",", ":")),
+                        genesis_prev_hash,
+                        genesis_entry_hash,
+                    ),
+                )
+
+                # Seed Genesis Checkpoint.
+                # MANDATE_SIGNING_KEY is validated to be non-empty and >= 32 bytes at
+                # Settings() construction time. No fallback is permitted here.
+                if not settings.MANDATE_SIGNING_KEY:
+                    raise RuntimeError(
+                        "MANDATE_SIGNING_KEY is required to initialize the genesis "
+                        "audit checkpoint. Ensure the key is set before starting the server."
+                    )
+                genesis_sig = sign_checkpoint(
+                    1, genesis_entry_hash, genesis_now, settings.MANDATE_SIGNING_KEY
+                )
+                await db.execute(
+                    """
+                    INSERT INTO audit_checkpoints (
+                        sequence_number, entry_hash, sealed_at, sealed_by, checkpoint_sig
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (1, genesis_entry_hash, genesis_ts, "SYSTEM_INIT", genesis_sig),
+                )
 
         await db.commit()
 
@@ -662,7 +857,8 @@ async def consume_approval_token_in_db(
         if row["consumed_at"] is not None:
             return (
                 False,
-                f"Approval token has already been consumed at {row['consumed_at']} (replay detected).",
+                f"Approval token has already been consumed at {row['consumed_at']} "
+                "(replay detected).",
             )
 
         if row["expires_at"] < consumed_at_iso:
@@ -695,3 +891,403 @@ async def consume_approval_token_in_db(
         except Exception:
             await conn.rollback()
             raise
+
+
+def _parse_iso_utc(val: str | None) -> datetime | None:
+    """Parse an ISO timestamp string, ensuring it is timezone-aware UTC."""
+    if not val:
+        return None
+    dt = datetime.fromisoformat(val)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _row_to_kill_switch_status(row: aiosqlite.Row) -> KillSwitchStatus:
+    """Map a SQLite row to KillSwitchStatus."""
+    return KillSwitchStatus(
+        kill_switch_active=bool(row["kill_switch_active"]),
+        engaged_at=_parse_iso_utc(row["engaged_at"]),
+        engaged_by=row["engaged_by"],
+        reason=row["reason"],
+        updated_at=_parse_iso_utc(row["updated_at"]),
+    )
+
+
+def _row_to_audit_entry(row: aiosqlite.Row) -> AuditLogEntry:
+    """Map a SQLite row to AuditLogEntry."""
+    return AuditLogEntry(
+        sequence_number=row["sequence_number"],
+        timestamp=_parse_iso_utc(row["timestamp"]),
+        event_type=row["event_type"],
+        entity_type=row["entity_type"],
+        entity_id=row["entity_id"],
+        actor=row["actor"],
+        payload=json.loads(row["payload_json"]),
+        prev_hash=row["prev_hash"],
+        entry_hash=row["entry_hash"],
+    )
+
+
+def _row_to_checkpoint(row: aiosqlite.Row) -> AuditCheckpoint:
+    """Map a SQLite row to AuditCheckpoint."""
+    return AuditCheckpoint(
+        checkpoint_id=row["checkpoint_id"],
+        sequence_number=row["sequence_number"],
+        entry_hash=row["entry_hash"],
+        sealed_at=_parse_iso_utc(row["sealed_at"]),
+        sealed_by=row["sealed_by"],
+        checkpoint_sig=row["checkpoint_sig"],
+    )
+
+
+async def is_kill_switch_active(db: aiosqlite.Connection | None = None) -> bool:
+    """Return True if emergency kill switch is currently engaged."""
+    query = "SELECT kill_switch_active FROM system_controls WHERE control_id = 1"
+    if db is not None:
+        async with db.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row is not None else False
+
+    async with get_connection() as conn:
+        async with conn.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row is not None else False
+
+
+async def get_kill_switch_status(
+    db: aiosqlite.Connection | None = None,
+) -> KillSwitchStatus:
+    """Retrieve full system controls status."""
+    query = "SELECT * FROM system_controls WHERE control_id = 1"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("system_controls table is not initialized.")
+            return _row_to_kill_switch_status(row)
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                raise RuntimeError("system_controls table is not initialized.")
+            return _row_to_kill_switch_status(row)
+
+
+async def set_kill_switch_state(
+    active: bool,
+    engaged_by: str | None,
+    reason: str | None,
+    now: datetime | None = None,
+    db: aiosqlite.Connection | None = None,
+) -> KillSwitchStatus:
+    """Update kill switch state in system_controls."""
+    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_iso = now_utc.isoformat()
+    engaged_at_iso = now_iso if active else None
+
+    query = """
+        UPDATE system_controls
+        SET kill_switch_active = ?,
+            engaged_at = ?,
+            engaged_by = ?,
+            reason = ?,
+            updated_at = ?
+        WHERE control_id = 1
+    """
+    params = (
+        1 if active else 0,
+        engaged_at_iso,
+        engaged_by,
+        reason,
+        now_iso,
+    )
+
+    if db is not None:
+        await db.execute(query, params)
+        return await get_kill_switch_status(db=db)
+
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
+        return await get_kill_switch_status(db=conn)
+
+
+async def get_latest_audit_entry(
+    db: aiosqlite.Connection | None = None,
+) -> AuditLogEntry | None:
+    """Retrieve the latest record at the tip of the audit chain."""
+    query = "SELECT * FROM audit_logs ORDER BY sequence_number DESC LIMIT 1"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_audit_entry(row) if row is not None else None
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_audit_entry(row) if row is not None else None
+
+
+async def _execute_insert_audit_log(
+    conn: aiosqlite.Connection, entry: AuditLogEntry
+) -> None:
+    """Validate and insert an audit log entry within an open connection."""
+    computed_hash = entry.compute_canonical_hash()
+    if entry.entry_hash != computed_hash:
+        raise ValueError(
+            f"entry_hash mismatch for sequence {entry.sequence_number}: "
+            f"stored entry_hash starts with '{entry.entry_hash[:12]}...', "
+            f"but canonical recompute gives '{computed_hash[:12]}...'. "
+            "Ensure entry_hash is computed via canonical_audit_hash(entry.to_envelope()) "
+            "and that the envelope was not modified after hashing."
+        )
+
+    # Validate sequence contiguity and prev_hash linking
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        "SELECT sequence_number, entry_hash FROM audit_logs "
+        "ORDER BY sequence_number DESC LIMIT 1"
+    ) as cursor:
+        last_row = await cursor.fetchone()
+
+    if last_row is None:
+        if entry.sequence_number != 1:
+            raise ValueError(
+                f"First audit entry must have sequence_number=1, got {entry.sequence_number}."
+            )
+        if entry.prev_hash != "0" * 64:
+            raise ValueError(
+                f"Genesis audit entry must have prev_hash='{'0'*64}', got '{entry.prev_hash}'."
+            )
+    else:
+        expected_seq = last_row["sequence_number"] + 1
+        expected_prev_hash = last_row["entry_hash"]
+        if entry.sequence_number != expected_seq:
+            raise ValueError(
+                f"Non-contiguous sequence_number for audit log: expected {expected_seq}, "
+                f"got {entry.sequence_number}."
+            )
+        if entry.prev_hash != expected_prev_hash:
+            raise ValueError(
+                f"Invalid prev_hash for sequence {entry.sequence_number}: expected preceding "
+                f"entry_hash '{expected_prev_hash}', got '{entry.prev_hash}'."
+            )
+
+    query = """
+        INSERT INTO audit_logs (
+            sequence_number, timestamp, event_type, entity_type,
+            entity_id, actor, payload_json, prev_hash, entry_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        entry.sequence_number,
+        entry.timestamp.astimezone(timezone.utc).isoformat(),
+        entry.event_type,
+        entry.entity_type,
+        entry.entity_id,
+        entry.actor,
+        json.dumps(entry.payload, sort_keys=True, separators=(",", ":")),
+        entry.prev_hash,
+        entry.entry_hash,
+    )
+    await conn.execute(query, params)
+
+
+async def insert_audit_log_entry(
+    entry: AuditLogEntry,
+    db: aiosqlite.Connection | None = None,
+) -> None:
+    """Insert a verified audit record into audit_logs.
+
+    Guarantees:
+    - Canonical hash recomputation and verification.
+    - Contiguous sequence allocation and strict prev_hash chain linking.
+    - Atomic execution using SQLite BEGIN IMMEDIATE when managing its own connection.
+
+    Raises:
+        ValueError: If entry_hash, sequence_number, or prev_hash fails verification.
+    """
+    if db is not None:
+        await _execute_insert_audit_log(db, entry)
+        return
+
+    async with get_connection() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await _execute_insert_audit_log(conn, entry)
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+
+async def list_audit_log_entries(
+    limit: int = 50,
+    offset: int = 0,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    event_type: str | None = None,
+    db: aiosqlite.Connection | None = None,
+) -> tuple[list[AuditLogEntry], int]:
+    """List audit log records with optional filtering and pagination."""
+    conditions: list[str] = []
+    params: list[Any] = []
+
+    if entity_type is not None:
+        conditions.append("entity_type = ?")
+        params.append(entity_type)
+    if entity_id is not None:
+        conditions.append("entity_id = ?")
+        params.append(entity_id)
+    if event_type is not None:
+        conditions.append("event_type = ?")
+        params.append(event_type)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    count_query = f"SELECT COUNT(*) FROM audit_logs {where_clause}"
+    select_query = f"""
+        SELECT * FROM audit_logs
+        {where_clause}
+        ORDER BY sequence_number ASC
+        LIMIT ? OFFSET ?
+    """
+
+    async def _fetch(conn: aiosqlite.Connection) -> tuple[list[AuditLogEntry], int]:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(count_query, params) as c_cursor:
+            total = (await c_cursor.fetchone())[0]
+
+        fetch_params = tuple(params + [limit, offset])
+        async with conn.execute(select_query, fetch_params) as s_cursor:
+            rows = await s_cursor.fetchall()
+            return [_row_to_audit_entry(r) for r in rows], total
+
+    if db is not None:
+        return await _fetch(db)
+
+    async with get_connection() as conn:
+        return await _fetch(conn)
+
+
+async def get_audit_checkpoints(
+    db: aiosqlite.Connection | None = None,
+) -> list[AuditCheckpoint]:
+    """Retrieve all audit checkpoints in ascending order."""
+    query = "SELECT * FROM audit_checkpoints ORDER BY checkpoint_id ASC"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_checkpoint(r) for r in rows]
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_checkpoint(r) for r in rows]
+
+
+async def insert_audit_checkpoint(
+    checkpoint: AuditCheckpoint,
+    db: aiosqlite.Connection | None = None,
+) -> None:
+    """Insert a signed checkpoint into audit_checkpoints."""
+    query = """
+        INSERT INTO audit_checkpoints (
+            sequence_number, entry_hash, sealed_at, sealed_by, checkpoint_sig
+        ) VALUES (?, ?, ?, ?, ?)
+    """
+    params = (
+        checkpoint.sequence_number,
+        checkpoint.entry_hash,
+        checkpoint.sealed_at.astimezone(timezone.utc).isoformat(),
+        checkpoint.sealed_by,
+        checkpoint.checkpoint_sig,
+    )
+    if db is not None:
+        await db.execute(query, params)
+        return
+
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
+
+
+async def get_audit_entry_by_sequence(
+    sequence_number: int,
+    db: aiosqlite.Connection | None = None,
+) -> AuditLogEntry | None:
+    """Retrieve a single audit log entry by its sequence number."""
+    query = "SELECT * FROM audit_logs WHERE sequence_number = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (sequence_number,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_audit_entry(row) if row is not None else None
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (sequence_number,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_audit_entry(row) if row is not None else None
+
+
+async def get_all_audit_entries(
+    db: aiosqlite.Connection | None = None,
+) -> list[AuditLogEntry]:
+    """Retrieve all audit log entries in ascending sequence order."""
+    query = "SELECT * FROM audit_logs ORDER BY sequence_number ASC"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_audit_entry(r) for r in rows]
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_audit_entry(r) for r in rows]
+
+
+async def get_checkpoint_by_sequence(
+    sequence_number: int,
+    db: aiosqlite.Connection | None = None,
+) -> AuditCheckpoint | None:
+    """Retrieve a checkpoint by its target sequence number."""
+    query = "SELECT * FROM audit_checkpoints WHERE sequence_number = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (sequence_number,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_checkpoint(row) if row is not None else None
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (sequence_number,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_checkpoint(row) if row is not None else None
+
+
+async def get_latest_audit_checkpoint(
+    db: aiosqlite.Connection | None = None,
+) -> AuditCheckpoint | None:
+    """Retrieve the latest checkpoint anchor with the highest sequence number."""
+    query = "SELECT * FROM audit_checkpoints ORDER BY sequence_number DESC LIMIT 1"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_checkpoint(row) if row is not None else None
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_checkpoint(row) if row is not None else None

@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import aiosqlite
 
+from app.core.security import format_money
 from app.db.database import (
     StoredProposalTamperedError,
     get_connection,
@@ -22,6 +23,7 @@ from app.db.database import (
     list_proposals_from_db,
     update_proposal_status_in_db,
 )
+from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.policy import (
     DecisionOutcome,
     EvaluationContext,
@@ -116,7 +118,26 @@ async def create_proposal(payload: ProposalCreate) -> tuple[Proposal, bool]:
         return existing_fp, False
 
     try:
-        await insert_proposal_to_db(proposal)
+        async with get_connection() as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            await insert_proposal_to_db(proposal, db=conn)
+            from app.services.audit_service import AuditService  # noqa: PLC0415
+
+            await AuditService.append_event(
+                event_type=AuditEventType.PROPOSAL_CREATED,
+                entity_type=AuditEntityType.PROPOSAL,
+                entity_id=proposal.proposal_id,
+                actor=AuditActor.AGENT,
+                payload={
+                    "currency": proposal.currency,
+                    "mandate_id": proposal.mandate_id,
+                    "merchant": proposal.merchant,
+                    "proposal_id": proposal.proposal_id,
+                    "total": format_money(proposal.total),
+                },
+                db=conn,
+            )
+            await conn.commit()
     except aiosqlite.IntegrityError:
         raced = await get_proposal_by_fingerprint(proposal.fingerprint)
         if raced is not None:
@@ -282,6 +303,29 @@ async def evaluate_proposal_service(
                     await set_proposal_status(proposal_id, ProposalStatus.REJECTED, db=db)
                 elif decision.decision == DecisionOutcome.ALLOW:
                     await set_proposal_status(proposal_id, ProposalStatus.APPROVED, db=db)
+
+            # Audit evaluation outcome atomically in this same transaction
+            from app.services.audit_service import AuditService  # noqa: PLC0415
+
+            if decision.decision == DecisionOutcome.BLOCK:
+                eval_event = AuditEventType.AUTHORIZATION_BLOCKED
+            elif decision.decision == DecisionOutcome.ALLOW:
+                eval_event = AuditEventType.PROPOSAL_APPROVED
+            else:
+                eval_event = AuditEventType.PROPOSAL_EVALUATED
+
+            await AuditService.append_event(
+                event_type=eval_event,
+                entity_type=AuditEntityType.PROPOSAL,
+                entity_id=proposal_id,
+                actor=AuditActor.POLICY_ENGINE,
+                payload={
+                    "decision": decision.decision.value,
+                    "mandate_id": mandate.mandate_id,
+                    "proposal_id": proposal_id,
+                },
+                db=db,
+            )
 
             await db.commit()
             return decision

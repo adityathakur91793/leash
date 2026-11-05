@@ -1,4 +1,7 @@
-"""Unit tests for Policy Engine Rules P10, P11, P12, and Full Engine Evaluation (Phase 2C.4 - 2C.6)."""
+"""Unit tests for Policy Engine Rules P10, P11, P12, and Full Engine Evaluation.
+
+Covers Phase 2C.4 - 2C.6 deterministic policy engine evaluation.
+"""
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal

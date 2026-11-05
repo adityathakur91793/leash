@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 from app.core.security import validate_signing_secret
@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # Loaded only from the environment or .env — never a source-code default.
     MANDATE_SIGNING_KEY: str = ""
     MANDATE_KEY_ALGORITHM: str = "HMAC-SHA256"
+
+    # Administrative API key for emergency kill switch and audit inspection (Phase 2D).
+    # Loaded strictly from environment or .env — never a source-code default.
+    ADMIN_API_KEY: str = ""
 
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
@@ -73,6 +77,18 @@ class Settings(BaseSettings):
         """Reject missing or weak mandate signing secrets at configuration load."""
         validate_signing_secret(v)
         return v
+
+    @model_validator(mode="after")
+    def validate_production_admin_api_key(self) -> "Settings":
+        """Enforce minimum 32-character ADMIN_API_KEY when DEBUG=False."""
+        if not self.DEBUG:
+            key = self.ADMIN_API_KEY
+            if not key or not isinstance(key, str) or len(key.encode("utf-8")) < 32:
+                raise ValueError(
+                    "ADMIN_API_KEY must be configured with at least 32 characters "
+                    "when DEBUG=False (production mode)."
+                )
+        return self
 
     model_config = {
         "env_file": (
