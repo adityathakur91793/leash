@@ -3,6 +3,8 @@
 import uuid
 from datetime import datetime, timezone
 
+import aiosqlite
+
 from app.core.config import settings
 from app.core.security import (
     canonicalize_mandate_payload,
@@ -39,7 +41,9 @@ class MandateTamperedError(Exception):
     """Raised when signature verification detects mandate tampering."""
 
 
-async def _expire_if_needed(mandate: Mandate) -> Mandate:
+async def _expire_if_needed(
+    mandate: Mandate, db: aiosqlite.Connection | None = None
+) -> Mandate:
     """Transition a mandate to EXPIRED when its validity window has closed."""
     now = datetime.now(timezone.utc)
     if now >= mandate.expires_at and mandate.status not in (
@@ -47,7 +51,7 @@ async def _expire_if_needed(mandate: Mandate) -> Mandate:
         MandateStatus.REVOKED,
     ):
         mandate.status = MandateStatus.EXPIRED
-        await save_mandate_to_db(mandate)
+        await save_mandate_to_db(mandate, db=db)
     return mandate
 
 
@@ -79,13 +83,15 @@ async def create_draft_mandate(data: MandateCreate) -> Mandate:
     return mandate
 
 
-async def get_mandate(mandate_id: str) -> Mandate:
+async def get_mandate(
+    mandate_id: str, db: aiosqlite.Connection | None = None
+) -> Mandate:
     """Retrieve a mandate by ID, evaluating expiration if necessary."""
-    mandate = await get_mandate_from_db(mandate_id)
+    mandate = await get_mandate_from_db(mandate_id, db=db)
     if mandate is None:
         raise MandateNotFoundError(f"Mandate with ID '{mandate_id}' was not found.")
 
-    return await _expire_if_needed(mandate)
+    return await _expire_if_needed(mandate, db=db)
 
 
 async def confirm_mandate(mandate_id: str) -> Mandate:

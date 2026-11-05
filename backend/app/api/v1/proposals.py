@@ -7,6 +7,7 @@ scope for this resource.
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
+from app.schemas.policy import PolicyDecision
 from app.schemas.proposal import Proposal, ProposalCreate
 from app.services.mandate_service import MandateNotFoundError
 from app.services.proposal_service import (
@@ -15,6 +16,7 @@ from app.services.proposal_service import (
     ProposalNotFoundError,
     ProposalTamperedError,
     create_proposal,
+    evaluate_proposal_service,
     get_proposal,
     list_proposals,
 )
@@ -86,4 +88,13 @@ async def get_proposal_endpoint(proposal_id: str) -> Proposal:
     try:
         return await get_proposal(proposal_id)
     except (ProposalNotFoundError, ProposalTamperedError) as exc:
+        raise _http_for_proposal_errors(exc) from exc
+
+
+@router.post("/{proposal_id}/evaluate", response_model=PolicyDecision)
+async def evaluate_proposal_endpoint(proposal_id: str) -> PolicyDecision:
+    """Evaluate a stored purchase proposal against its mandate using the policy engine."""
+    try:
+        return await evaluate_proposal_service(proposal_id)
+    except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc

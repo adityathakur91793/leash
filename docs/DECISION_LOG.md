@@ -33,3 +33,17 @@ payment must remain a later PayPal step. Mixing those into proposal creation
 would collapse the trust boundary.
 **Trade-offs**: Evaluation status exists on the model for later phases, but
 proposal APIs in 2B do not approve purchases or capture payment.
+
+
+## DL-006: Deterministic Policy Engine Security Architecture (Phase 2C)
+**Date**: 2026-11-04
+**Decision**: The Policy Engine executes 100% deterministic, side-effect-free Python logic without LLMs or external network calls.
+- **Budget Ceilings are Immutable**: User approval of individual purchase proposals cannot expand or override the mandate's signed `max_total_budget` (Rule P03 is a hard block). Modifying budget requires cryptographically resigning a new mandate.
+- **One-Time Exceptions Never Mutate Mandates**: Exceptions for unlisted merchants (P05) or categories (P06) produce single-use authorization tokens bound to the specific proposal. They never alter the signed mandate allowlists.
+- **Empty Allowlist is Fail-Closed**: An empty `allowed_categories` list permits zero categories (Rule P06 yields `BLOCK`).
+- **Live-Price Evidence Required**: When a live-price oracle is unavailable, stale, or unindexed, Rule P09 evaluates to `NOT_APPLICABLE` (never a false `PASS`).
+- **Atomic Spend Reservation**: Concurrency races on daily transaction limits (Rule P10) are mitigated by evaluating and writing spend reservations inside a SQLite `BEGIN IMMEDIATE` transaction, accounting for proposals in `SUBMITTED`, `EVALUATED`, and `APPROVED` states.
+- **Idempotent Replay**: Replaying an identical proposal or idempotency key returns the existing proposal record without creating duplicate authorizations or spend reservations.
+- **Defense-in-Depth for Untrusted Text**: Rule P12 enforces strict structural integrity, rejects URI credentials, and blocks SSRF target hosts. Prompt injection patterns are flagged as audit heuristics, while true safety is guaranteed by treating product copy as opaque literal text that is never interpreted or executed.
+**Rationale**: Eliminates non-deterministic LLM hallucinations and prompt injections from the trust boundary, ensuring mathematical enforceability of user-granted purchase authority.
+**Trade-offs**: Policy engine requires structured schema fields and does not support fuzzy natural-language purchase rules.

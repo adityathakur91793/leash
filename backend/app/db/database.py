@@ -1,5 +1,6 @@
 """Lightweight async SQLite database helpers using aiosqlite."""
 
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -163,64 +164,95 @@ async def init_db() -> None:
                 "INSERT INTO schema_version (version, applied_at) "
                 "VALUES (3, datetime('now'))"
             )
+            current_version = 3
             logger.info("Applied migration version 3 (proposals)")
+
+        # Migration 4: Approval tokens tracking (Phase 2C Remediation)
+        if current_version < 4:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approval_tokens (
+                    token_hash    TEXT PRIMARY KEY,
+                    proposal_id   TEXT NOT NULL,
+                    expires_at    TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    consumed_at   TEXT,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id)
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_tokens_proposal_id "
+                "ON approval_tokens(proposal_id)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (4, datetime('now'))"
+            )
+            current_version = 4
+            logger.info("Applied migration version 4 (approval_tokens)")
 
         await db.commit()
 
     logger.info("Database initialisation complete")
 
 
-async def save_mandate_to_db(mandate: Mandate) -> None:
+async def save_mandate_to_db(
+    mandate: Mandate, db: aiosqlite.Connection | None = None
+) -> None:
     """Persist a mandate record to SQLite.
 
     Immutable permissions are preserved; only lifecycle status and signature
     metadata are updated if the record already exists.
     """
-    async with get_connection() as db:
-        await db.execute(
-            """
-            INSERT INTO mandates (
-                mandate_id, schema_version, status, currency, max_total_budget,
-                max_price_per_item, max_item_count, max_quantity_per_item,
-                allow_subscriptions, require_user_approval, allowed_merchants,
-                allowed_categories, created_at, expires_at, signature,
-                signed_at, signature_algorithm
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(mandate_id) DO UPDATE SET
-                status = excluded.status,
-                signature = excluded.signature,
-                signed_at = excluded.signed_at,
-                signature_algorithm = excluded.signature_algorithm
-            """,
-            (
-                mandate.mandate_id,
-                mandate.schema_version,
-                mandate.status.value,
-                mandate.currency,
-                f"{mandate.max_total_budget:.2f}",
-                (
-                    f"{mandate.max_price_per_item:.2f}"
-                    if mandate.max_price_per_item is not None
-                    else None
-                ),
-                mandate.max_item_count,
-                mandate.max_quantity_per_item,
-                1 if mandate.allow_subscriptions else 0,
-                1 if mandate.require_user_approval else 0,
-                json.dumps(mandate.allowed_merchants),
-                json.dumps(mandate.allowed_categories),
-                mandate.created_at.astimezone(timezone.utc).isoformat(),
-                mandate.expires_at.astimezone(timezone.utc).isoformat(),
-                mandate.signature,
-                (
-                    mandate.signed_at.astimezone(timezone.utc).isoformat()
-                    if mandate.signed_at
-                    else None
-                ),
-                mandate.signature_algorithm,
-            ),
-        )
-        await db.commit()
+    query = """
+        INSERT INTO mandates (
+            mandate_id, schema_version, status, currency, max_total_budget,
+            max_price_per_item, max_item_count, max_quantity_per_item,
+            allow_subscriptions, require_user_approval, allowed_merchants,
+            allowed_categories, created_at, expires_at, signature,
+            signed_at, signature_algorithm
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(mandate_id) DO UPDATE SET
+            status = excluded.status,
+            signature = excluded.signature,
+            signed_at = excluded.signed_at,
+            signature_algorithm = excluded.signature_algorithm
+    """
+    params = (
+        mandate.mandate_id,
+        mandate.schema_version,
+        mandate.status.value,
+        mandate.currency,
+        f"{mandate.max_total_budget:.2f}",
+        (
+            f"{mandate.max_price_per_item:.2f}"
+            if mandate.max_price_per_item is not None
+            else None
+        ),
+        mandate.max_item_count,
+        mandate.max_quantity_per_item,
+        1 if mandate.allow_subscriptions else 0,
+        1 if mandate.require_user_approval else 0,
+        json.dumps(mandate.allowed_merchants),
+        json.dumps(mandate.allowed_categories),
+        mandate.created_at.astimezone(timezone.utc).isoformat(),
+        mandate.expires_at.astimezone(timezone.utc).isoformat(),
+        mandate.signature,
+        (
+            mandate.signed_at.astimezone(timezone.utc).isoformat()
+            if mandate.signed_at
+            else None
+        ),
+        mandate.signature_algorithm,
+    )
+    if db is not None:
+        await db.execute(query, params)
+        return
+
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
 
 
 def _row_to_mandate(row: aiosqlite.Row) -> Mandate:
@@ -248,13 +280,22 @@ def _row_to_mandate(row: aiosqlite.Row) -> Mandate:
     )
 
 
-async def get_mandate_from_db(mandate_id: str) -> Mandate | None:
+async def get_mandate_from_db(
+    mandate_id: str, db: aiosqlite.Connection | None = None
+) -> Mandate | None:
     """Retrieve a single mandate by its ID."""
-    async with get_connection() as db:
+    query = "SELECT * FROM mandates WHERE mandate_id = ?"
+    if db is not None:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM mandates WHERE mandate_id = ?", (mandate_id,)
-        ) as cursor:
+        async with db.execute(query, (mandate_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return _row_to_mandate(row)
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (mandate_id,)) as cursor:
             row = await cursor.fetchone()
             if row is None:
                 return None
@@ -305,97 +346,133 @@ def _row_to_proposal(row: aiosqlite.Row) -> Proposal:
     return Proposal.model_validate(raw)
 
 
-async def insert_proposal_to_db(proposal: Proposal) -> None:
+async def insert_proposal_to_db(
+    proposal: Proposal, db: aiosqlite.Connection | None = None
+) -> None:
     """Insert a new proposal. Commercial terms are write-once."""
-    async with get_connection() as db:
-        await db.execute(
-            """
-            INSERT INTO proposals (
-                proposal_id, schema_version, status, mandate_id, product_id,
-                product_name, merchant, category, quantity, unit_price, currency,
-                subtotal, tax, shipping, other_charges, total, product_source,
-                created_at, idempotency_key, fingerprint, content_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                proposal.proposal_id,
-                proposal.schema_version,
-                proposal.status.value,
-                proposal.mandate_id,
-                proposal.product_id,
-                proposal.product_name,
-                proposal.merchant,
-                proposal.category,
-                proposal.quantity,
-                f"{proposal.unit_price:.2f}",
-                proposal.currency,
-                f"{proposal.subtotal:.2f}",
-                f"{proposal.tax:.2f}",
-                f"{proposal.shipping:.2f}",
-                f"{proposal.other_charges:.2f}",
-                f"{proposal.total:.2f}",
-                proposal.product_source,
-                proposal.created_at.astimezone(timezone.utc).isoformat(),
-                proposal.idempotency_key,
-                proposal.fingerprint,
-                proposal.content_hash,
-            ),
-        )
-        await db.commit()
+    query = """
+        INSERT INTO proposals (
+            proposal_id, schema_version, status, mandate_id, product_id,
+            product_name, merchant, category, quantity, unit_price, currency,
+            subtotal, tax, shipping, other_charges, total, product_source,
+            created_at, idempotency_key, fingerprint, content_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        proposal.proposal_id,
+        proposal.schema_version,
+        proposal.status.value,
+        proposal.mandate_id,
+        proposal.product_id,
+        proposal.product_name,
+        proposal.merchant,
+        proposal.category,
+        proposal.quantity,
+        f"{proposal.unit_price:.2f}",
+        proposal.currency,
+        f"{proposal.subtotal:.2f}",
+        f"{proposal.tax:.2f}",
+        f"{proposal.shipping:.2f}",
+        f"{proposal.other_charges:.2f}",
+        f"{proposal.total:.2f}",
+        proposal.product_source,
+        proposal.created_at.astimezone(timezone.utc).isoformat(),
+        proposal.idempotency_key,
+        proposal.fingerprint,
+        proposal.content_hash,
+    )
+    if db is not None:
+        await db.execute(query, params)
+        return
+
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
 
 
 async def update_proposal_status_in_db(
     proposal_id: str,
     new_status: ProposalStatus,
     expected_current_status: ProposalStatus,
+    db: aiosqlite.Connection | None = None,
 ) -> bool:
     """Update proposal status only. Returns True if a row was updated."""
-    async with get_connection() as db:
-        cursor = await db.execute(
-            """
-            UPDATE proposals
-            SET status = ?
-            WHERE proposal_id = ? AND status = ?
-            """,
-            (new_status.value, proposal_id, expected_current_status.value),
-        )
-        await db.commit()
+    query = """
+        UPDATE proposals
+        SET status = ?
+        WHERE proposal_id = ? AND status = ?
+    """
+    params = (new_status.value, proposal_id, expected_current_status.value)
+    if db is not None:
+        cursor = await db.execute(query, params)
+        return cursor.rowcount == 1
+
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        await conn.commit()
         return cursor.rowcount == 1
 
 
-async def get_proposal_from_db(proposal_id: str) -> Proposal | None:
+async def get_proposal_from_db(
+    proposal_id: str, db: aiosqlite.Connection | None = None
+) -> Proposal | None:
     """Retrieve a single proposal by ID."""
-    async with get_connection() as db:
+    query = "SELECT * FROM proposals WHERE proposal_id = ?"
+    if db is not None:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
-        ) as cursor:
+        async with db.execute(query, (proposal_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return _row_to_proposal(row)
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (proposal_id,)) as cursor:
             row = await cursor.fetchone()
             if row is None:
                 return None
             return _row_to_proposal(row)
 
 
-async def get_proposal_by_fingerprint(fingerprint: str) -> Proposal | None:
+async def get_proposal_by_fingerprint(
+    fingerprint: str, db: aiosqlite.Connection | None = None
+) -> Proposal | None:
     """Retrieve a proposal by duplicate-protection fingerprint."""
-    async with get_connection() as db:
+    query = "SELECT * FROM proposals WHERE fingerprint = ?"
+    if db is not None:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM proposals WHERE fingerprint = ?", (fingerprint,)
-        ) as cursor:
+        async with db.execute(query, (fingerprint,)) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return _row_to_proposal(row)
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (fingerprint,)) as cursor:
             row = await cursor.fetchone()
             if row is None:
                 return None
             return _row_to_proposal(row)
 
 
-async def get_proposal_by_idempotency_key(idempotency_key: str) -> Proposal | None:
+async def get_proposal_by_idempotency_key(
+    idempotency_key: str, db: aiosqlite.Connection | None = None
+) -> Proposal | None:
     """Retrieve a proposal by client idempotency key."""
-    async with get_connection() as db:
+    query = "SELECT * FROM proposals WHERE idempotency_key = ?"
+    if db is not None:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM proposals WHERE idempotency_key = ?", (idempotency_key,)
-        ) as cursor:
+        async with db.execute(query, (idempotency_key,)) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return _row_to_proposal(row)
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (idempotency_key,)) as cursor:
             row = await cursor.fetchone()
             if row is None:
                 return None
@@ -420,3 +497,201 @@ async def list_proposals_from_db(
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_proposal(row) for row in rows]
+
+
+async def get_today_reserved_spend(
+    mandate_id: str,
+    for_date_iso: str,
+    exclude_proposal_id: str | None = None,
+    db: aiosqlite.Connection | None = None,
+) -> Decimal:
+    """Sum total of SUBMITTED, EVALUATED, and APPROVED proposals for mandate today.
+
+    Optionally excludes exclude_proposal_id to prevent double-counting of the proposal
+    currently being evaluated.
+    """
+    if exclude_proposal_id is not None:
+        query = """
+            SELECT total FROM proposals
+            WHERE mandate_id = ?
+              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED')
+              AND date(created_at) = date(?)
+              AND proposal_id != ?
+        """
+        params: tuple[object, ...] = (mandate_id, for_date_iso, exclude_proposal_id)
+    else:
+        query = """
+            SELECT total FROM proposals
+            WHERE mandate_id = ?
+              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED')
+              AND date(created_at) = date(?)
+        """
+        params = (mandate_id, for_date_iso)
+
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return sum((Decimal(row["total"]) for row in rows), Decimal("0.00"))
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return sum((Decimal(row["total"]) for row in rows), Decimal("0.00"))
+
+
+async def get_cumulative_mandate_spent(
+    mandate_id: str,
+    exclude_proposal_id: str | None = None,
+    db: aiosqlite.Connection | None = None,
+) -> Decimal:
+    """Sum total of approved/settled proposals for mandate.
+
+    Optionally excludes exclude_proposal_id to prevent double-counting.
+    """
+    if exclude_proposal_id is not None:
+        query = """
+            SELECT total FROM proposals
+            WHERE mandate_id = ?
+              AND status IN ('EVALUATED', 'APPROVED')
+              AND proposal_id != ?
+        """
+        params: tuple[object, ...] = (mandate_id, exclude_proposal_id)
+    else:
+        query = """
+            SELECT total FROM proposals
+            WHERE mandate_id = ?
+              AND status IN ('EVALUATED', 'APPROVED')
+        """
+        params = (mandate_id,)
+
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return sum((Decimal(row["total"]) for row in rows), Decimal("0.00"))
+
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return sum((Decimal(row["total"]) for row in rows), Decimal("0.00"))
+
+
+def hash_approval_token(token: str) -> str:
+    """Compute deterministic SHA-256 hash of approval token.
+
+    Raw approval tokens are never stored in the database.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def record_approval_token_in_db(
+    token_hash: str,
+    proposal_id: str,
+    expires_at_iso: str,
+    created_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> None:
+    """Persist an issued approval token hash and metadata before use."""
+    query = """
+        INSERT INTO approval_tokens (
+            token_hash, proposal_id, expires_at, created_at, consumed_at
+        ) VALUES (?, ?, ?, ?, NULL)
+    """
+    params = (token_hash, proposal_id, expires_at_iso, created_at_iso)
+    if db is not None:
+        await db.execute(query, params)
+        return
+
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
+
+
+async def consume_approval_token_in_db(
+    token_hash: str,
+    proposal_id: str,
+    consumed_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> tuple[bool, str]:
+    """Atomically consume an approval token, preventing replay or concurrent use.
+
+    Returns:
+        Tuple of (success, reason).
+    """
+    query_lookup = "SELECT * FROM approval_tokens WHERE token_hash = ?"
+
+    async def _execute_consume(conn: aiosqlite.Connection) -> tuple[bool, str]:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query_lookup, (token_hash,)) as cursor:
+            row = await cursor.fetchone()
+
+        if row is None:
+            # Token was not pre-registered; insert as consumed atomically
+            async with conn.execute(
+                "SELECT proposal_id FROM proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ) as p_cursor:
+                if await p_cursor.fetchone() is None:
+                    return False, f"Proposal '{proposal_id}' not found."
+
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO approval_tokens (
+                        token_hash, proposal_id, expires_at, created_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        token_hash,
+                        proposal_id,
+                        consumed_at_iso,
+                        consumed_at_iso,
+                        consumed_at_iso,
+                    ),
+                )
+                return True, "Approval token consumed successfully."
+            except aiosqlite.IntegrityError:
+                return False, "Approval token already consumed (concurrent replay detected)."
+
+        if row["proposal_id"] != proposal_id:
+            return False, f"Approval token is not bound to proposal '{proposal_id}'."
+
+        if row["consumed_at"] is not None:
+            return (
+                False,
+                f"Approval token has already been consumed at {row['consumed_at']} (replay detected).",
+            )
+
+        if row["expires_at"] < consumed_at_iso:
+            return False, f"Approval token expired at {row['expires_at']}."
+
+        cursor = await conn.execute(
+            """
+            UPDATE approval_tokens
+            SET consumed_at = ?
+            WHERE token_hash = ? AND consumed_at IS NULL
+            """,
+            (consumed_at_iso, token_hash),
+        )
+        if cursor.rowcount == 1:
+            return True, "Approval token consumed successfully."
+        return False, "Approval token already consumed concurrently (replay detected)."
+
+    if db is not None:
+        return await _execute_consume(db)
+
+    async with get_connection() as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            success, reason = await _execute_consume(conn)
+            if success:
+                await conn.commit()
+            else:
+                await conn.rollback()
+            return success, reason
+        except Exception:
+            await conn.rollback()
+            raise

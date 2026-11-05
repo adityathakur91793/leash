@@ -6,17 +6,27 @@ Proposals are not authorizations and never trigger payment execution.
 import logging
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import aiosqlite
 
 from app.db.database import (
     StoredProposalTamperedError,
+    get_connection,
+    get_cumulative_mandate_spent,
     get_proposal_by_fingerprint,
     get_proposal_by_idempotency_key,
     get_proposal_from_db,
+    get_today_reserved_spend,
     insert_proposal_to_db,
     list_proposals_from_db,
     update_proposal_status_in_db,
+)
+from app.schemas.policy import (
+    DecisionOutcome,
+    EvaluationContext,
+    OracleResult,
+    PolicyDecision,
 )
 from app.schemas.proposal import (
     CONTENT_LOCKED_STATUSES,
@@ -26,11 +36,16 @@ from app.schemas.proposal import (
     build_proposal_from_create,
 )
 from app.services.mandate_service import get_mandate
+from app.services.policy_engine import evaluate_policy
 
 logger = logging.getLogger(__name__)
 
 ALLOWED_STATUS_TRANSITIONS: dict[ProposalStatus, set[ProposalStatus]] = {
-    ProposalStatus.SUBMITTED: {ProposalStatus.EVALUATED, ProposalStatus.WITHDRAWN},
+    ProposalStatus.SUBMITTED: {
+        ProposalStatus.EVALUATED,
+        ProposalStatus.REJECTED,
+        ProposalStatus.WITHDRAWN,
+    },
     ProposalStatus.EVALUATED: {ProposalStatus.APPROVED, ProposalStatus.REJECTED},
 }
 
@@ -124,10 +139,12 @@ async def create_proposal(payload: ProposalCreate) -> tuple[Proposal, bool]:
     return proposal, True
 
 
-async def get_proposal(proposal_id: str) -> Proposal:
+async def get_proposal(
+    proposal_id: str, db: aiosqlite.Connection | None = None
+) -> Proposal:
     """Retrieve a proposal, rejecting tampered stored contents."""
     try:
-        proposal = await get_proposal_from_db(proposal_id)
+        proposal = await get_proposal_from_db(proposal_id, db=db)
     except StoredProposalTamperedError as exc:
         raise ProposalTamperedError(str(exc)) from exc
     if proposal is None:
@@ -148,14 +165,16 @@ async def list_proposals(
 
 
 async def set_proposal_status(
-    proposal_id: str, new_status: ProposalStatus
+    proposal_id: str,
+    new_status: ProposalStatus,
+    db: aiosqlite.Connection | None = None,
 ) -> Proposal:
     """Transition proposal status without altering commercial terms.
 
     This records evaluation outcome only. It does not authorize payment
     execution and does not mutate locked proposal fields.
     """
-    proposal = await get_proposal(proposal_id)
+    proposal = await get_proposal(proposal_id, db=db)
     allowed = ALLOWED_STATUS_TRANSITIONS.get(proposal.status, set())
     if new_status not in allowed:
         if proposal.status in CONTENT_LOCKED_STATUSES:
@@ -169,13 +188,13 @@ async def set_proposal_status(
         )
 
     updated = await update_proposal_status_in_db(
-        proposal_id, new_status, proposal.status
+        proposal_id, new_status, proposal.status, db=db
     )
     if not updated:
         raise InvalidProposalStatusTransitionError(
             f"Proposal '{proposal_id}' status changed concurrently."
         )
-    return await get_proposal(proposal_id)
+    return await get_proposal(proposal_id, db=db)
 
 
 async def reject_content_mutation(proposal_id: str) -> None:
@@ -185,3 +204,87 @@ async def reject_content_mutation(proposal_id: str) -> None:
         f"Proposal '{proposal.proposal_id}' commercial terms are immutable. "
         "Create a new proposal to request different purchase terms."
     )
+
+
+async def evaluate_proposal_service(
+    proposal_id: str,
+    oracle_result: OracleResult | None = None,
+    daily_limit: Decimal | None = None,
+    now: datetime | None = None,
+) -> PolicyDecision:
+    """Evaluate a stored purchase proposal against its mandate using the policy engine.
+
+    Gathers transactional spend data, runs all 12 rules, updates proposal state,
+    and returns the structured PolicyDecision under an atomic SQLite transaction lock.
+
+    Args:
+        proposal_id: Unique ID of proposal to evaluate.
+        oracle_result: Optional live price reading for rule P09.
+        daily_limit: Optional daily transaction cap for rule P10.
+        now: Optional override for current UTC timestamp (for testing).
+
+    Returns:
+        Structured PolicyDecision.
+    """
+    eval_now = now or datetime.now(timezone.utc)
+    today_iso = eval_now.date().isoformat()
+
+    async with get_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            proposal = await get_proposal(proposal_id, db=db)
+            mandate = await get_mandate(proposal.mandate_id, db=db)
+
+            today_reserved = await get_today_reserved_spend(
+                mandate.mandate_id,
+                today_iso,
+                exclude_proposal_id=proposal_id,
+                db=db,
+            )
+            cumulative_spent = await get_cumulative_mandate_spent(
+                mandate.mandate_id,
+                exclude_proposal_id=proposal_id,
+                db=db,
+            )
+            existing_fp = await get_proposal_by_fingerprint(proposal.fingerprint, db=db)
+            existing_ik = None
+            if proposal.idempotency_key:
+                existing_ik = await get_proposal_by_idempotency_key(
+                    proposal.idempotency_key, db=db
+                )
+
+            context = EvaluationContext(
+                now=eval_now,
+                today_reserved=today_reserved,
+                daily_txn_limit=daily_limit,
+                cumulative_mandate_spent=cumulative_spent,
+                oracle_result=oracle_result,
+            )
+
+            decision = evaluate_policy(
+                proposal=proposal,
+                mandate=mandate,
+                context=context,
+                existing_by_fingerprint=existing_fp,
+                existing_by_idempotency_key=existing_ik,
+            )
+
+            # State transition based on evaluation outcome
+            if proposal.status == ProposalStatus.SUBMITTED:
+                if decision.decision == DecisionOutcome.BLOCK:
+                    await set_proposal_status(proposal_id, ProposalStatus.REJECTED, db=db)
+                else:
+                    await set_proposal_status(proposal_id, ProposalStatus.EVALUATED, db=db)
+                    if decision.decision == DecisionOutcome.ALLOW:
+                        await set_proposal_status(proposal_id, ProposalStatus.APPROVED, db=db)
+            elif proposal.status == ProposalStatus.EVALUATED:
+                if decision.decision == DecisionOutcome.BLOCK:
+                    await set_proposal_status(proposal_id, ProposalStatus.REJECTED, db=db)
+                elif decision.decision == DecisionOutcome.ALLOW:
+                    await set_proposal_status(proposal_id, ProposalStatus.APPROVED, db=db)
+
+            await db.commit()
+            return decision
+        except Exception:
+            await db.rollback()
+            raise

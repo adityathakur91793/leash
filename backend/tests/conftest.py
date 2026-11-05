@@ -28,6 +28,7 @@ async def init_test_db() -> AsyncIterator[None]:
     yield
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM approval_tokens")
         await db.execute("DELETE FROM proposals")
         await db.execute("DELETE FROM mandates")
         await db.commit()
