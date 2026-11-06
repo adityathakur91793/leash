@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     # Loaded strictly from environment or .env — never a source-code default.
     ADMIN_API_KEY: str = ""
 
+    # PayPal Sandbox Configuration (Phase 3).
+    # Credentials loaded from environment or .env — never source-code defaults.
+    PAYPAL_CLIENT_ID: str = ""
+    PAYPAL_CLIENT_SECRET: str = ""
+    PAYPAL_MODE: str = "sandbox"
+    PAYPAL_SANDBOX_BASE_URL: str = "https://api-m.sandbox.paypal.com"
+
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
@@ -77,6 +84,17 @@ class Settings(BaseSettings):
         """Reject missing or weak mandate signing secrets at configuration load."""
         validate_signing_secret(v)
         return v
+
+    @field_validator("PAYPAL_MODE", mode="after")
+    @classmethod
+    def validate_paypal_mode(cls, v: str) -> str:
+        """Enforce sandbox-only execution (₹0 budget constraint)."""
+        mode = v.strip().lower()
+        if mode != "sandbox":
+            raise ValueError(
+                f"Invalid PAYPAL_MODE '{v}'. Only 'sandbox' mode is permitted in LEASH."
+            )
+        return mode
 
     @model_validator(mode="after")
     def validate_production_admin_api_key(self) -> "Settings":

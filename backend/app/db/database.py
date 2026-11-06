@@ -22,6 +22,7 @@ from app.schemas.audit import (
 )
 from app.schemas.kill_switch import KillSwitchStatus
 from app.schemas.mandate import Mandate, MandateStatus
+from app.schemas.payment import PayPalOrderRecord, PayPalOrderStatus
 from app.schemas.proposal import Proposal, ProposalStatus
 
 logger = logging.getLogger(__name__)
@@ -416,6 +417,54 @@ async def init_db() -> None:
                 "Applied migration version 6 (user_sessions, mandate owner_user_id)"
             )
 
+        # Migration 7: PayPal Orders and Payment Execution (Phase 3)
+        if current_version < 7:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS paypal_orders (
+                    order_id            TEXT PRIMARY KEY,
+                    proposal_id         TEXT NOT NULL UNIQUE,
+                    mandate_id          TEXT NOT NULL,
+                    owner_user_id       TEXT NOT NULL,
+                    status              TEXT NOT NULL,
+                    currency            TEXT NOT NULL,
+                    total_amount        TEXT NOT NULL,
+                    subtotal            TEXT NOT NULL,
+                    tax                 TEXT NOT NULL,
+                    shipping            TEXT NOT NULL,
+                    other_charges       TEXT NOT NULL,
+                    approval_url        TEXT NOT NULL,
+                    paypal_request_id   TEXT NOT NULL,
+                    capture_id          TEXT,
+                    capture_request_id  TEXT,
+                    created_at          TEXT NOT NULL,
+                    updated_at          TEXT NOT NULL,
+                    captured_at         TEXT,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id),
+                    FOREIGN KEY (mandate_id) REFERENCES mandates(mandate_id)
+                )
+            """)
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_paypal_orders_proposal "
+                "ON paypal_orders(proposal_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paypal_orders_mandate "
+                "ON paypal_orders(mandate_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paypal_orders_owner "
+                "ON paypal_orders(owner_user_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paypal_orders_status "
+                "ON paypal_orders(status)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (7, datetime('now'))"
+            )
+            current_version = 7
+            logger.info("Applied migration version 7 (paypal_orders)")
+
         await db.commit()
 
     logger.info("Database initialisation complete")
@@ -748,7 +797,7 @@ async def get_today_reserved_spend(
         query = """
             SELECT total FROM proposals
             WHERE mandate_id = ?
-              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED')
+              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED', 'SETTLED')
               AND date(created_at) = date(?)
               AND proposal_id != ?
         """
@@ -757,7 +806,7 @@ async def get_today_reserved_spend(
         query = """
             SELECT total FROM proposals
             WHERE mandate_id = ?
-              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED')
+              AND status IN ('SUBMITTED', 'EVALUATED', 'APPROVED', 'SETTLED')
               AND date(created_at) = date(?)
         """
         params = (mandate_id, for_date_iso)
@@ -788,7 +837,7 @@ async def get_cumulative_mandate_spent(
         query = """
             SELECT total FROM proposals
             WHERE mandate_id = ?
-              AND status IN ('EVALUATED', 'APPROVED')
+              AND status IN ('EVALUATED', 'APPROVED', 'SETTLED')
               AND proposal_id != ?
         """
         params: tuple[object, ...] = (mandate_id, exclude_proposal_id)
@@ -796,7 +845,7 @@ async def get_cumulative_mandate_spent(
         query = """
             SELECT total FROM proposals
             WHERE mandate_id = ?
-              AND status IN ('EVALUATED', 'APPROVED')
+              AND status IN ('EVALUATED', 'APPROVED', 'SETTLED')
         """
         params = (mandate_id,)
 
@@ -1409,6 +1458,167 @@ async def revoke_session_in_db(
         WHERE session_token_hash = ? AND revoked_at IS NULL
     """
     params = (revoked_at_iso, token_hash)
+    if db is not None:
+        cursor = await db.execute(query, params)
+        return cursor.rowcount > 0
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+def _row_to_paypal_order(row: aiosqlite.Row) -> PayPalOrderRecord:
+    """Map a SQLite row to a PayPalOrderRecord model."""
+    captured_at = row["captured_at"]
+    return PayPalOrderRecord(
+        order_id=row["order_id"],
+        proposal_id=row["proposal_id"],
+        mandate_id=row["mandate_id"],
+        owner_user_id=row["owner_user_id"],
+        status=PayPalOrderStatus(row["status"]),
+        currency=row["currency"],
+        total_amount=Decimal(row["total_amount"]),
+        subtotal=Decimal(row["subtotal"]),
+        tax=Decimal(row["tax"]),
+        shipping=Decimal(row["shipping"]),
+        other_charges=Decimal(row["other_charges"]),
+        approval_url=row["approval_url"],
+        paypal_request_id=row["paypal_request_id"],
+        capture_id=row["capture_id"],
+        capture_request_id=row["capture_request_id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        captured_at=datetime.fromisoformat(captured_at) if captured_at else None,
+    )
+
+
+async def insert_paypal_order_in_db(
+    order: PayPalOrderRecord, db: aiosqlite.Connection | None = None
+) -> None:
+    """Insert a new PayPal order record into the database."""
+    query = """
+        INSERT INTO paypal_orders (
+            order_id, proposal_id, mandate_id, owner_user_id, status,
+            currency, total_amount, subtotal, tax, shipping, other_charges,
+            approval_url, paypal_request_id, capture_id, capture_request_id,
+            created_at, updated_at, captured_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        order.order_id,
+        order.proposal_id,
+        order.mandate_id,
+        order.owner_user_id,
+        order.status.value,
+        order.currency,
+        f"{order.total_amount:.2f}",
+        f"{order.subtotal:.2f}",
+        f"{order.tax:.2f}",
+        f"{order.shipping:.2f}",
+        f"{order.other_charges:.2f}",
+        order.approval_url,
+        order.paypal_request_id,
+        order.capture_id,
+        order.capture_request_id,
+        order.created_at.astimezone(timezone.utc).isoformat(),
+        order.updated_at.astimezone(timezone.utc).isoformat(),
+        order.captured_at.astimezone(timezone.utc).isoformat() if order.captured_at else None,
+    )
+    if db is not None:
+        await db.execute(query, params)
+        return
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
+
+
+async def get_paypal_order_from_db(
+    order_id: str, db: aiosqlite.Connection | None = None
+) -> PayPalOrderRecord | None:
+    """Retrieve a PayPal order by its PayPal order_id."""
+    query = "SELECT * FROM paypal_orders WHERE order_id = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_order(row) if row is not None else None
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_order(row) if row is not None else None
+
+
+async def get_paypal_order_by_proposal_from_db(
+    proposal_id: str, db: aiosqlite.Connection | None = None
+) -> PayPalOrderRecord | None:
+    """Retrieve an existing PayPal order associated with a proposal."""
+    query = "SELECT * FROM paypal_orders WHERE proposal_id = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (proposal_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_order(row) if row is not None else None
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (proposal_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_order(row) if row is not None else None
+
+
+async def update_paypal_order_captured_in_db(
+    order_id: str,
+    capture_id: str,
+    capture_request_id: str,
+    captured_at_iso: str,
+    updated_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> bool:
+    """Atomically record capture for a PayPal order if not already captured."""
+    query = """
+        UPDATE paypal_orders
+        SET status = ?,
+            capture_id = ?,
+            capture_request_id = ?,
+            captured_at = ?,
+            updated_at = ?
+        WHERE order_id = ? AND status != ?
+    """
+    params = (
+        PayPalOrderStatus.COMPLETED.value,
+        capture_id,
+        capture_request_id,
+        captured_at_iso,
+        updated_at_iso,
+        order_id,
+        PayPalOrderStatus.COMPLETED.value,
+    )
+    if db is not None:
+        cursor = await db.execute(query, params)
+        return cursor.rowcount > 0
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def update_paypal_order_status_in_db(
+    order_id: str,
+    status: PayPalOrderStatus,
+    updated_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> bool:
+    """Update status of a PayPal order."""
+    query = (
+        "UPDATE paypal_orders SET status = ?, updated_at = ? "
+        "WHERE order_id = ? AND status != ?"
+    )
+    params = (
+        status.value,
+        updated_at_iso,
+        order_id,
+        PayPalOrderStatus.COMPLETED.value,
+    )
     if db is not None:
         cursor = await db.execute(query, params)
         return cursor.rowcount > 0

@@ -40,6 +40,7 @@ class ProposalStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
     EVALUATED = "EVALUATED"
     APPROVED = "APPROVED"
+    SETTLED = "SETTLED"
     REJECTED = "REJECTED"
     WITHDRAWN = "WITHDRAWN"
 
@@ -47,6 +48,7 @@ class ProposalStatus(str, Enum):
 CONTENT_LOCKED_STATUSES = {
     ProposalStatus.EVALUATED,
     ProposalStatus.APPROVED,
+    ProposalStatus.SETTLED,
     ProposalStatus.REJECTED,
     ProposalStatus.WITHDRAWN,
 }

@@ -111,6 +111,54 @@ async def test_init_db_applies_audit_logs_schema_version() -> None:
 
 
 @pytest.mark.asyncio
+async def test_migration_7_creates_paypal_orders_schema() -> None:
+    """Migration 7 creates durable, uniquely proposal-bound PayPal orders."""
+    import aiosqlite
+
+    from app.db.database import get_db_path
+
+    async with aiosqlite.connect(get_db_path()) as db:
+        cursor = await db.execute("SELECT MAX(version) FROM schema_version")
+        assert (await cursor.fetchone())[0] >= 7
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='paypal_orders'"
+        )
+        assert (await cursor.fetchone())[0] == "paypal_orders"
+        cursor = await db.execute("PRAGMA index_list(paypal_orders)")
+        indexes = {row[1] for row in await cursor.fetchall()}
+        assert "idx_paypal_orders_proposal" in indexes
+
+
+@pytest.mark.asyncio
+async def test_paypal_order_reconciliation_cannot_demote_completed_order() -> None:
+    """A late timeout handler must not overwrite concurrent capture success."""
+    import aiosqlite
+    from datetime import datetime, timezone
+
+    from app.db.database import update_paypal_order_status_in_db
+    from app.schemas.payment import PayPalOrderStatus
+
+    async with aiosqlite.connect(":memory:") as db:
+        await db.execute(
+            "CREATE TABLE paypal_orders (order_id TEXT, status TEXT, updated_at TEXT)"
+        )
+        await db.execute(
+            "INSERT INTO paypal_orders VALUES (?, ?, ?)",
+            ("order-1", PayPalOrderStatus.COMPLETED.value, datetime.now(timezone.utc).isoformat()),
+        )
+        changed = await update_paypal_order_status_in_db(
+            "order-1",
+            PayPalOrderStatus.RECONCILIATION_REQUIRED,
+            datetime.now(timezone.utc).isoformat(),
+            db=db,
+        )
+        cursor = await db.execute("SELECT status FROM paypal_orders WHERE order_id = ?", ("order-1",))
+        row = await cursor.fetchone()
+        assert changed is False
+        assert row[0] == PayPalOrderStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
 async def test_save_mandate_does_not_overwrite_permissions() -> None:
     """Verify ON CONFLICT updates keep permission columns immutable."""
     from decimal import Decimal

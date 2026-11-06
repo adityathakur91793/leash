@@ -20,6 +20,14 @@ os.environ.setdefault(
     "ADMIN_API_KEY",
     "leash-test-admin-key-32-bytes-minimum-secret!!",
 )
+os.environ.setdefault(
+    "PAYPAL_CLIENT_ID",
+    "mock-paypal-client-id",
+)
+os.environ.setdefault(
+    "PAYPAL_CLIENT_SECRET",
+    "mock-paypal-client-secret",
+)
 
 from app.db.database import get_db_path, init_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -32,6 +40,7 @@ async def init_test_db() -> AsyncIterator[None]:
     yield
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM paypal_orders")
         await db.execute("DELETE FROM audit_checkpoints")
         await db.execute("DELETE FROM audit_logs")
         await db.execute("DELETE FROM approval_tokens")

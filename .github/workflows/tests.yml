@@ -34,6 +34,5 @@ jobs:
         run: pytest tests/ -v --tb=short
         env:
           DATABASE_URL: "sqlite:///./test_leash.db"
-          APP_NAME: "LEASH"
-          DEBUG: "false"
           MANDATE_SIGNING_KEY: "ci-test-signing-key-32-bytes-minimum-value!"
+          ADMIN_API_KEY: "ci-test-admin-key-32-bytes-minimum-secret!"

@@ -49,6 +49,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[ProposalStatus, set[ProposalStatus]] = {
         ProposalStatus.WITHDRAWN,
     },
     ProposalStatus.EVALUATED: {ProposalStatus.APPROVED, ProposalStatus.REJECTED},
+    ProposalStatus.APPROVED: {ProposalStatus.SETTLED, ProposalStatus.WITHDRAWN},
 }
 
 

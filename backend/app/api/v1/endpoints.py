@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1.admin import router as admin_router
 from app.api.v1.approval import router as approval_router
 from app.api.v1.mandates import router as mandates_router
+from app.api.v1.payments import router as payments_router
 from app.api.v1.proposals import router as proposals_router
 from app.api.v1.sessions import router as sessions_router
 from app.core.config import settings
@@ -27,3 +28,4 @@ router.include_router(mandates_router)
 router.include_router(proposals_router)
 router.include_router(admin_router)
 router.include_router(approval_router)
+router.include_router(payments_router)
