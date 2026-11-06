@@ -596,6 +596,21 @@ async def list_mandates_from_db(limit: int = 50) -> list[Mandate]:
             return [_row_to_mandate(row) for row in rows]
 
 
+async def list_mandates_for_owner_from_db(
+    owner_user_id: str, limit: int = 100
+) -> list[Mandate]:
+    """Retrieve only mandates permanently assigned to one authenticated principal."""
+    query = (
+        "SELECT * FROM mandates WHERE owner_user_id = ? "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (owner_user_id, limit)) as cursor:
+            rows = await cursor.fetchall()
+            return [_row_to_mandate(row) for row in rows]
+
+
 def _row_to_proposal(row: aiosqlite.Row) -> Proposal:
     """Map a SQLite row to a Proposal model after integrity verification."""
     raw = {

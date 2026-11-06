@@ -153,3 +153,77 @@ body {
   color: var(--text-secondary);
   font-size: 0.8rem;
 }
+
+.shopping-agent {
+  margin-top: 2rem;
+  padding: 1.5rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.shopping-heading, .product-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.shopping-heading p, .agent-note, .product-card p, .proposal-outcome p {
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+}
+
+.simulated-badge {
+  color: #fbbf24;
+  border: 1px solid #92400e;
+  border-radius: 999px;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.mandate-select, .agent-form { display: grid; gap: 0.6rem; margin-top: 1.25rem; }
+.mandate-select select, .agent-form textarea {
+  width: 100%;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem;
+  font: inherit;
+}
+.agent-form textarea { min-height: 90px; resize: vertical; }
+.agent-form button {
+  justify-self: end;
+  border: 0;
+  border-radius: 8px;
+  padding: 0.7rem 1rem;
+  color: white;
+  background: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.agent-form button:disabled { opacity: 0.55; cursor: wait; }
+.agent-error { margin-top: 1rem; color: var(--error); }
+.agent-conversation { display: grid; gap: 1rem; margin-top: 1.25rem; }
+.agent-turn { display: grid; gap: 0.75rem; }
+.user-message { text-align: right; color: #c7d2fe; }
+.product-card, .proposal-outcome {
+  padding: 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.product-card dl { display: grid; gap: 0.4rem; margin-top: 0.8rem; }
+.product-card dl div { display: flex; justify-content: space-between; gap: 1rem; }
+.product-card dt { color: var(--text-secondary); }
+.product-card dd { text-align: right; }
+.proposal-outcome { border-color: var(--accent); }
+
+@media (max-width: 600px) {
+  .shopping-agent { padding: 1rem; }
+  .shopping-heading { align-items: flex-start; flex-direction: column; }
+  .product-card dl div { flex-direction: column; gap: 0.1rem; }
+  .product-card dd { text-align: left; }
+}

@@ -1,6 +1,7 @@
 import { Shield } from 'lucide-react';
 import { useBackendStatus } from './hooks/useBackendStatus';
 import { StatusCard } from './components/StatusCard';
+import { ShoppingAgent } from './components/ShoppingAgent';
 import './App.css';
 
 function App() {
@@ -32,6 +33,7 @@ function App() {
             />
           </div>
         </section>
+        <ShoppingAgent />
       </main>
 
       <footer className="app-footer">

@@ -99,6 +99,37 @@ Retrieve details of a specific mandate by its ID.
 - **Response:** `200 OK` (returns full `Mandate` object)
 - **Error:** `404 Not Found` if mandate does not exist.
 
+---
+
+## Phase 4 Shopping Agent
+
+Both endpoints below require `Authorization: Bearer <session_token>`. The raw
+session token is issued once by `POST /api/v1/sessions`; the client must keep it
+private and must not send a principal or owner ID.
+
+### GET /api/v1/shopping-agent/mandates
+
+Returns only the current session principal's active, unexpired, signature-
+verified mandates. Mandate ownership is derived from the server-side session.
+
+### POST /api/v1/shopping-agent/chat
+
+Request body accepts `message` (1–1500 characters) and optional `mandate_id`.
+The complete request body is capped at 8192 bytes. Unknown properties are
+rejected. The model can call exactly three tools:
+
+- `search_products`: optional keyword/category/merchant/price/currency filters.
+- `get_product`: exact stable simulated catalogue `product_id`.
+- `propose_purchase`: exact `product_id` plus quantity. Commercial facts are
+  resolved from the local catalogue; the selected mandate is checked against
+  the authenticated owner's active signed mandate.
+
+Product prices and stock states are simulation fixtures and are never presented
+as live merchant data. A proposal response includes separate proposal status
+and deterministic policy decision fields. It does not issue an approval token,
+create a PayPal order, or execute payment. Gemini is configured only on the
+backend with `GEMINI_API_KEY` and optional `GEMINI_MODEL`.
+
 ### POST /api/v1/mandates/{mandate_id}/confirm
 Explicit user confirmation of a `DRAFT` mandate, locking permissions.
 

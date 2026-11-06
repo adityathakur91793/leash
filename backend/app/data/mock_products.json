@@ -1,0 +1,72 @@
+[
+  {
+    "product_id": "demo_bottle_001",
+    "name": "Trailmark Insulated Bottle 750 ml",
+    "description": "Double-wall insulated bottle for day hikes. Simulated catalogue listing.",
+    "merchant_id": "trailmark.example",
+    "merchant_name": "Trailmark Outfitters (simulated)",
+    "category": "outdoors",
+    "unit_price": "24.50",
+    "tax": "0.00",
+    "shipping": "0.00",
+    "other_charges": "0.00",
+    "currency": "USD",
+    "availability": "SIMULATED_AVAILABLE"
+  },
+  {
+    "product_id": "demo_lamp_002",
+    "name": "Northstar Dimmable Desk Lamp",
+    "description": "LED desk lamp with three simulated brightness settings.",
+    "merchant_id": "northstar.example",
+    "merchant_name": "Northstar Home (simulated)",
+    "category": "home",
+    "unit_price": "38.00",
+    "tax": "0.00",
+    "shipping": "0.00",
+    "other_charges": "0.00",
+    "currency": "USD",
+    "availability": "SIMULATED_AVAILABLE"
+  },
+  {
+    "product_id": "demo_notebook_003",
+    "name": "Fieldnotes Recycled Paper Notebook",
+    "description": "A5 notebook made with recycled paper. Simulated catalogue listing.",
+    "merchant_id": "fieldnotes.example",
+    "merchant_name": "Fieldnotes Paper Co. (simulated)",
+    "category": "stationery",
+    "unit_price": "12.25",
+    "tax": "0.00",
+    "shipping": "0.00",
+    "other_charges": "0.00",
+    "currency": "USD",
+    "availability": "SIMULATED_AVAILABLE"
+  },
+  {
+    "product_id": "demo_tote_004",
+    "name": "Everyday Canvas Tote Bag",
+    "description": "Reusable canvas tote. Stock state is intentionally unknown in this fixture.",
+    "merchant_id": "everyday.example",
+    "merchant_name": "Everyday Goods (simulated)",
+    "category": "accessories",
+    "unit_price": "16.75",
+    "tax": "0.00",
+    "shipping": "0.00",
+    "other_charges": "0.00",
+    "currency": "USD",
+    "availability": "UNKNOWN"
+  },
+  {
+    "product_id": "demo_mug_005",
+    "name": "Cedar Ceramic Travel Mug",
+    "description": "Ceramic travel mug with a fitted lid. Simulated catalogue listing.",
+    "merchant_id": "cedar.example",
+    "merchant_name": "Cedar Kitchen (simulated)",
+    "category": "kitchen",
+    "unit_price": "19.95",
+    "tax": "0.00",
+    "shipping": "0.00",
+    "other_charges": "0.00",
+    "currency": "USD",
+    "availability": "SIMULATED_UNAVAILABLE"
+  }
+]

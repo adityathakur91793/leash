@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     PAYPAL_MODE: str = "sandbox"
     PAYPAL_SANDBOX_BASE_URL: str = "https://api-m.sandbox.paypal.com"
 
+    # Gemini Shopping Agent configuration. The key remains backend-only.
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+
     @field_validator("CORS_ORIGINS", mode="after")
     @classmethod
     def parse_cors_origins(cls, v: Any) -> list[str]:
@@ -95,6 +99,17 @@ class Settings(BaseSettings):
                 f"Invalid PAYPAL_MODE '{v}'. Only 'sandbox' mode is permitted in LEASH."
             )
         return mode
+
+    @field_validator("GEMINI_MODEL", mode="after")
+    @classmethod
+    def validate_gemini_model(cls, value: str) -> str:
+        """Keep the configurable model identifier out of URL syntax and paths."""
+        import re
+
+        model = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", model):
+            raise ValueError("GEMINI_MODEL must be a simple model identifier.")
+        return model
 
     @model_validator(mode="after")
     def validate_production_admin_api_key(self) -> "Settings":

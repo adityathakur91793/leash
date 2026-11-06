@@ -36,9 +36,9 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 - Pydantic models with strict validation (`extra="forbid"`).
 - Exact Decimal monetary types and UTC timestamps.
 
-## Current State (Phase 2B Complete)
-- Foundation operational (health and status probes).
-- SQLite database schema versioning (Version 3).
+## Current State (Phase 4 Shopping Agent)
+- Foundation, mandate, proposal, policy, audit, secure-session, and PayPal Sandbox phases are implemented.
+- SQLite database schema versioning (Version 7).
 - Mandate subsystem operational:
   - Strict Pydantic validation (budget, currency, merchants, expiration).
   - Deterministic canonical JSON serialization.
@@ -51,3 +51,10 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
   - Untrusted product fields stored as opaque text (never executed or fetched).
   - Write-once commercial terms, duplicate protection via fingerprint and idempotency key.
   - REST endpoints under `/api/v1/proposals` (create, get, list).
+- Shopping Agent (`/api/v1/shopping-agent`):
+  - Backend-only Gemini REST integration using existing `httpx` and `GEMINI_API_KEY`.
+  - Exactly three model tools: `search_products`, `get_product`, and `propose_purchase`.
+  - Deterministic local catalogue with explicitly simulated prices and availability.
+  - Proposal tool accepts only a catalogue product ID and quantity; ownership, active mandate signature, expiry, kill switch, and deterministic policy are enforced server-side.
+  - Agent modules have no approval-token or payment-executor imports. Proposal evaluation is not payment execution.
+  - Product descriptions are HTML-stripped, capped, and heuristically checked for prompt-injection indicators; the heuristic is defense in depth, not a safety guarantee.

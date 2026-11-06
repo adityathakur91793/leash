@@ -100,3 +100,30 @@ evaluation outcome, not a payment execution.
 | **Proposal replay / duplicate spend request** | Fingerprint uniqueness and optional idempotency keys return the original proposal. |
 | **In-place proposal mutation** | Commercial columns are write-once; content hash verification detects storage tampering. |
 | **Proposal without mandate** | Foreign key plus explicit existence check; missing mandate returns 404. |
+
+---
+
+## Shopping Agent Boundary (Phase 4)
+
+- Gemini receives a fixed system instruction and only three declared functions;
+  the backend independently checks tool names and validates every argument with
+  strict Pydantic schemas. Tool rounds, message length, response bytes, and raw
+  HTTP request bytes are bounded.
+- The API identity comes exclusively from the validated Bearer session. The
+  proposal path reloads the mandate, verifies `owner_user_id`, signature,
+  ACTIVE state, and expiry, and fails closed when the emergency kill switch is
+  active.
+- `propose_purchase` accepts only a catalogue ID and quantity from the model.
+  Merchant, product name, price, currency, and availability are resolved from
+  the local catalogue. The existing proposal service creates the proposal and
+  the existing deterministic policy service evaluates it.
+- The agent does not import or call approval-token, PayPal order, or capture
+  services. An agent result is not a user approval or payment result.
+- Catalogue data is clearly simulated. HTML is removed, script/style contents
+  are omitted, descriptions are length-capped, and suspicious instruction-like
+  text is quarantined. Indicator matching is heuristic defense in depth; it
+  cannot guarantee detection of prompt injection.
+- Gemini credentials are read only from backend environment configuration,
+  transmitted in the provider API key header, and excluded from prompts,
+  frontend configuration, and application logs. The React app sends only its
+  session Bearer token using `VITE_API_URL`.

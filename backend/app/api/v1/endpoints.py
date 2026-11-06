@@ -8,6 +8,7 @@ from app.api.v1.mandates import router as mandates_router
 from app.api.v1.payments import router as payments_router
 from app.api.v1.proposals import router as proposals_router
 from app.api.v1.sessions import router as sessions_router
+from app.api.v1.shopping_agent import router as shopping_agent_router
 from app.core.config import settings
 
 router = APIRouter()
@@ -29,3 +30,4 @@ router.include_router(proposals_router)
 router.include_router(admin_router)
 router.include_router(approval_router)
 router.include_router(payments_router)
+router.include_router(shopping_agent_router)
