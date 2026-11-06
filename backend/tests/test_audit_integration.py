@@ -37,7 +37,9 @@ async def test_full_lifecycle_audit_integration_and_verification() -> None:
         require_user_approval=True,
         expires_at=datetime.now(timezone.utc) + timedelta(days=14),
     )
-    mandate = await create_draft_mandate(mandate_data)
+    mandate = await create_draft_mandate(
+        mandate_data, owner_user_id="user_photographer_session"
+    )
 
     # 2. Mandate confirm & sign -> MANDATE_SIGNED
     await confirm_mandate(mandate.mandate_id)
@@ -68,14 +70,14 @@ async def test_full_lifecycle_audit_integration_and_verification() -> None:
     # 5. One-time exception approval token issuance -> EXCEPTION_APPROVED (action=token_issued)
     token_meta = await issue_approval_token(
         proposal_id=proposal.proposal_id,
-        user_session_id="user_photographer_session",
+        principal_id="user_photographer_session",
     )
 
     # 6. One-time exception approval token consumption -> EXCEPTION_APPROVED
     success, reason = await consume_approval_token(
         proposal_id=proposal.proposal_id,
         token=token_meta["token"],
-        user_session_id="user_photographer_session",
+        principal_id="user_photographer_session",
         issued_at_iso=token_meta["issued_at"],
         nonce=token_meta["nonce"],
     )

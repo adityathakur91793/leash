@@ -37,6 +37,7 @@ async def init_test_db() -> AsyncIterator[None]:
         await db.execute("DELETE FROM approval_tokens")
         await db.execute("DELETE FROM proposals")
         await db.execute("DELETE FROM mandates")
+        await db.execute("DELETE FROM user_sessions")
         await db.execute(
             """
             UPDATE system_controls

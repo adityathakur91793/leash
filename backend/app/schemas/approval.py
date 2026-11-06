@@ -6,12 +6,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ApprovalTokenRequest(BaseModel):
-    """Request body for issuing a one-time approval token."""
+    """Request body for issuing a one-time approval token.
+
+    The authenticated principal identity is derived from the Bearer token
+    in the Authorization header — it is NOT supplied in the request body.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     proposal_id: str = Field(..., min_length=1, max_length=200)
-    user_session_id: str = Field(..., min_length=1, max_length=200)
 
 
 class ApprovalTokenResponse(BaseModel):
@@ -31,13 +34,16 @@ class ApprovalTokenResponse(BaseModel):
 
 
 class ApprovalConsumeRequest(BaseModel):
-    """Request body for consuming a one-time approval token."""
+    """Request body for consuming a one-time approval token.
+
+    The authenticated principal identity is derived from the Bearer token
+    in the Authorization header — it is NOT supplied in the request body.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     proposal_id: str = Field(..., min_length=1, max_length=200)
     token: str = Field(..., min_length=1, max_length=200)
-    user_session_id: str = Field(..., min_length=1, max_length=200)
     issued_at: str = Field(
         ...,
         description="ISO-8601 UTC timestamp returned when the token was issued.",

@@ -1,12 +1,14 @@
 """API endpoints for managing and verifying purchase mandates."""
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.api.dependencies import get_current_session
 from app.schemas.mandate import (
     Mandate,
     MandateCreate,
     MandateVerificationResponse,
 )
+from app.schemas.session import UserSession
 from app.services.mandate_service import (
     InvalidStateTransitionError,
     MandateExpiredError,
@@ -26,9 +28,17 @@ router = APIRouter(prefix="/mandates", tags=["Mandates"])
 
 
 @router.post("", response_model=Mandate, status_code=status.HTTP_201_CREATED)
-async def create_mandate_endpoint(payload: MandateCreate) -> Mandate:
-    """Create a new purchase authorization mandate in DRAFT status."""
-    return await create_draft_mandate(payload)
+async def create_mandate_endpoint(
+    payload: MandateCreate,
+    session: UserSession = Depends(get_current_session),
+) -> Mandate:
+    """Create a new purchase authorization mandate in DRAFT status.
+
+    Requires an authenticated session. The session's principal becomes the
+    permanent owner of the mandate and is the only principal authorized to
+    issue and consume approval tokens for it.
+    """
+    return await create_draft_mandate(payload, owner_user_id=session.user_id)
 
 
 @router.get("", response_model=list[Mandate])

@@ -47,7 +47,10 @@ def _proposal_api_payload(mandate_id: str, **overrides: object) -> dict:
 
 
 async def _create_mandate(client: httpx.AsyncClient) -> str:
-    response = await client.post("/api/v1/mandates", json=_mandate_api_payload())
+    session_res = await client.post("/api/v1/sessions", json={})
+    token = session_res.json()["session_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    response = await client.post("/api/v1/mandates", json=_mandate_api_payload(), headers=headers)
     assert response.status_code == 201
     return response.json()["mandate_id"]
 

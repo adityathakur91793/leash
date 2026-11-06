@@ -7,6 +7,13 @@ Hard BLOCK rules (P01, P02, P03, P08, P11, P12) cannot be overridden by
 any approval token.
 All token registration, consumption, state transitions, and audit records
 are committed atomically in single SQLite transactions under BEGIN IMMEDIATE.
+
+Ownership enforcement:
+- Mandates without an owner (owner_user_id IS NULL) fail closed with an error.
+  Legacy mandates created before Migration 6 are ownerless and cannot be
+  approved via the token system. Do NOT silently assign owners to them.
+- Only the principal that created the mandate (mandate.owner_user_id) may
+  issue or consume approval tokens for its proposals.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -37,6 +44,15 @@ from app.services.proposal_service import ProposalNotFoundError, get_proposal
 
 logger = logging.getLogger(__name__)
 
+
+class OwnerlessMandateError(Exception):
+    """Raised when an approval operation is attempted on an ownerless legacy mandate."""
+
+
+class MandateOwnershipError(Exception):
+    """Raised when a principal attempts an approval operation on a mandate they do not own."""
+
+
 # Hard BLOCK rule IDs that cannot be overridden by any approval token
 HARD_BLOCK_RULES: frozenset[str] = frozenset({"P01", "P02", "P03", "P08", "P11", "P12"})
 
@@ -45,20 +61,21 @@ _TOKEN_TTL_SECONDS = 900  # 15 minutes
 
 async def issue_approval_token(
     proposal_id: str,
-    user_session_id: str,
+    principal_id: str,
 ) -> dict:
     """Issue a short-lived HMAC-SHA256 approval token for a soft-approval proposal.
 
     Args:
         proposal_id: The proposal to bind the token to.
-        user_session_id: The authenticated user session identifier.
+        principal_id: The authenticated principal identifier from the session.
+            Must match mandate.owner_user_id.
 
     Returns:
         dict with keys: proposal_id, issued_at, expires_at, nonce, token.
 
     Raises:
         ValueError: If signing key is not configured, proposal is hard-blocked,
-                    or proposal does not exist.
+                    mandate is ownerless, or principal does not own the mandate.
         MandateNotFoundError: If the associated mandate cannot be found.
     """
     if not settings.MANDATE_SIGNING_KEY:
@@ -66,6 +83,18 @@ async def issue_approval_token(
 
     proposal = await get_proposal(proposal_id)
     mandate = await get_mandate(proposal.mandate_id)
+
+    # Ownership check: fail closed for ownerless mandates and wrong principal
+    if mandate.owner_user_id is None:
+        raise OwnerlessMandateError(
+            "Ownerless mandate: approval token issuance is not permitted for mandates "
+            "without an owner. Mandates created before session authentication was "
+            "introduced cannot be approved via the token system."
+        )
+    if mandate.owner_user_id != principal_id:
+        raise MandateOwnershipError(
+            "Forbidden: the authenticated principal does not own this mandate."
+        )
 
     now = datetime.now(timezone.utc)
     today_iso = now.date().isoformat()
@@ -121,7 +150,7 @@ async def issue_approval_token(
     token = generate_approval_token(
         proposal_id=proposal_id,
         content_hash=proposal.content_hash,
-        user_session_id=user_session_id,
+        user_session_id=principal_id,
         approval_timestamp=issued_at,
         nonce=nonce,
         expires_at=expires_at,
@@ -145,7 +174,7 @@ async def issue_approval_token(
                 actor=AuditActor.USER,
                 payload={
                     "proposal_id": proposal_id,
-                    "user_session_id": user_session_id[:50],
+                    "principal_id": principal_id[:50],
                     "action": "token_issued",
                 },
                 db=db,
@@ -167,7 +196,7 @@ async def issue_approval_token(
 async def consume_approval_token(
     proposal_id: str,
     token: str,
-    user_session_id: str,
+    principal_id: str,
     issued_at_iso: str,
     nonce: str,
 ) -> tuple[bool, str]:
@@ -176,7 +205,8 @@ async def consume_approval_token(
     Args:
         proposal_id: The proposal the token was issued for.
         token: The HMAC-SHA256 hex token.
-        user_session_id: The user session bound in the token.
+        principal_id: The authenticated principal identifier from the session.
+            Must match mandate.owner_user_id.
         issued_at_iso: ISO-8601 timestamp when the token was issued (server-issued).
         nonce: Cryptographic nonce bound in the token.
 
@@ -185,7 +215,8 @@ async def consume_approval_token(
 
     Raises:
         RuntimeError: If kill switch is active or unavailable.
-        ValueError: If signing key is not configured or parameters invalid.
+        ValueError: If signing key is not configured, mandate is ownerless,
+                    principal does not own the mandate, or parameters invalid.
         ProposalNotFoundError: If the proposal cannot be found.
     """
     # 1. Check kill switch first (fail closed)
@@ -198,6 +229,17 @@ async def consume_approval_token(
 
     proposal = await get_proposal(proposal_id)
     mandate = await get_mandate(proposal.mandate_id)
+
+    # Ownership check: fail closed for ownerless mandates and wrong principal
+    if mandate.owner_user_id is None:
+        raise OwnerlessMandateError(
+            "Ownerless mandate: approval token consumption is not permitted. "
+            "This mandate was created before session authentication was introduced."
+        )
+    if mandate.owner_user_id != principal_id:
+        raise MandateOwnershipError(
+            "Forbidden: the authenticated principal does not own this mandate."
+        )
 
     now = datetime.now(timezone.utc)
     today_iso = now.date().isoformat()
@@ -243,10 +285,10 @@ async def consume_approval_token(
                 reason = (
                     f"Hard BLOCK rule {rule.rule_id} cannot be overridden by approval token."
                 )
-                await _record_consume_failure_audit(proposal_id, user_session_id, reason)
+                await _record_consume_failure_audit(proposal_id, principal_id, reason)
                 return False, reason
         reason = "Policy evaluation resulted in BLOCK; approval token cannot override."
-        await _record_consume_failure_audit(proposal_id, user_session_id, reason)
+        await _record_consume_failure_audit(proposal_id, principal_id, reason)
         return False, reason
 
     # 4. Parse issued_at from server-issued value (do NOT trust client timestamp)
@@ -258,7 +300,7 @@ async def consume_approval_token(
             approval_timestamp = approval_timestamp.astimezone(timezone.utc)
     except (ValueError, TypeError) as exc:
         reason = f"Invalid issued_at timestamp format: {exc}"
-        await _record_consume_failure_audit(proposal_id, user_session_id, reason)
+        await _record_consume_failure_audit(proposal_id, principal_id, reason)
         return False, reason
 
     # 5. Atomically verify and consume the token in SQLite under BEGIN IMMEDIATE
@@ -269,7 +311,7 @@ async def consume_approval_token(
                 token=token,
                 proposal_id=proposal_id,
                 content_hash=proposal.content_hash,
-                user_session_id=user_session_id,
+                user_session_id=principal_id,
                 approval_timestamp=approval_timestamp,
                 nonce=nonce,
                 now=now,
@@ -278,7 +320,7 @@ async def consume_approval_token(
             )
             if not success:
                 await db.rollback()
-                await _record_consume_failure_audit(proposal_id, user_session_id, reason)
+                await _record_consume_failure_audit(proposal_id, principal_id, reason)
                 return False, reason
 
             # Token consumed successfully — update proposal status if applicable
@@ -299,7 +341,7 @@ async def consume_approval_token(
                 actor=AuditActor.USER,
                 payload={
                     "proposal_id": proposal_id,
-                    "user_session_id": user_session_id[:50],
+                    "principal_id": principal_id[:50],
                     "action": "token_consumed",
                 },
                 db=db,
@@ -313,10 +355,16 @@ async def consume_approval_token(
 
 async def _record_consume_failure_audit(
     proposal_id: str,
-    user_session_id: str,
+    principal_id: str,
     reason: str,
 ) -> None:
-    """Record an audit event for rejected token consumption in its own transaction."""
+    """Record an audit event for rejected token consumption in its own transaction.
+
+    Args:
+        proposal_id: The proposal whose token consumption failed.
+        principal_id: The principal that attempted consumption.
+        reason: Human-readable failure reason.
+    """
     try:
         await AuditService.append_event(
             event_type=AuditEventType.REPLAY_ATTEMPT_BLOCKED,
@@ -325,7 +373,7 @@ async def _record_consume_failure_audit(
             actor=AuditActor.USER,
             payload={
                 "proposal_id": proposal_id,
-                "user_session_id": user_session_id[:50],
+                "principal_id": principal_id[:50],
                 "action": "token_consume_failed",
                 "reason": reason[:200],
             },

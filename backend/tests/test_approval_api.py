@@ -21,7 +21,17 @@ from app.services.mandate_service import (
 from app.services.proposal_service import create_proposal
 
 
-async def _setup_soft_approval_proposal() -> tuple[str, str]:
+async def _auth_header(client: httpx.AsyncClient) -> tuple[dict[str, str], str]:
+    """Helper to create session and return Bearer auth header and principal ID."""
+    res = await client.post("/api/v1/sessions", json={})
+    token = res.json()["session_token"]
+    user_id = res.json()["user_id"]
+    return {"Authorization": f"Bearer {token}"}, user_id
+
+
+async def _setup_soft_approval_proposal(
+    owner_user_id: str,
+) -> tuple[str, str]:
     """Helper: create mandate with require_user_approval=True and proposal exceeding limit."""
     mandate_data = MandateCreate(
         max_total_budget=Decimal("500.00"),
@@ -35,7 +45,7 @@ async def _setup_soft_approval_proposal() -> tuple[str, str]:
         require_user_approval=True,  # Triggers REQUIRE_APPROVAL for over-limit item
         expires_at=datetime.now(timezone.utc) + timedelta(days=7),
     )
-    mandate = await create_draft_mandate(mandate_data)
+    mandate = await create_draft_mandate(mandate_data, owner_user_id=owner_user_id)
     await confirm_mandate(mandate.mandate_id)
     await sign_mandate(mandate.mandate_id)
     await activate_mandate(mandate.mandate_id)
@@ -59,7 +69,9 @@ async def _setup_soft_approval_proposal() -> tuple[str, str]:
     return proposal.proposal_id, mandate.mandate_id
 
 
-async def _setup_hard_block_proposal() -> str:
+async def _setup_hard_block_proposal(
+    owner_user_id: str,
+) -> str:
     """Helper: create proposal that triggers a hard BLOCK (e.g. currency mismatch P08)."""
     mandate_data = MandateCreate(
         max_total_budget=Decimal("100.00"),
@@ -73,7 +85,7 @@ async def _setup_hard_block_proposal() -> str:
         require_user_approval=True,
         expires_at=datetime.now(timezone.utc) + timedelta(days=7),
     )
-    mandate = await create_draft_mandate(mandate_data)
+    mandate = await create_draft_mandate(mandate_data, owner_user_id=owner_user_id)
     await confirm_mandate(mandate.mandate_id)
     await sign_mandate(mandate.mandate_id)
     await activate_mandate(mandate.mandate_id)
@@ -100,11 +112,13 @@ async def _setup_hard_block_proposal() -> str:
 @pytest.mark.asyncio
 async def test_issue_approval_token_success(client: httpx.AsyncClient) -> None:
     """Issue a valid one-time approval token for a soft-approval proposal."""
-    proposal_id, _ = await _setup_soft_approval_proposal()
+    headers, principal_id = await _auth_header(client)
+    proposal_id, _ = await _setup_soft_approval_proposal(owner_user_id=principal_id)
 
     response = await client.post(
         f"/api/v1/proposals/{proposal_id}/approval-token",
-        json={"proposal_id": proposal_id, "user_session_id": "sess_user_alpha"},
+        json={"proposal_id": proposal_id},
+        headers=headers,
     )
     assert response.status_code == 200
     data = response.json()
@@ -120,11 +134,13 @@ async def test_issue_approval_token_success(client: httpx.AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_issue_approval_token_rejects_hard_block(client: httpx.AsyncClient) -> None:
     """Hard BLOCK rules (e.g. P03 budget ceiling) cannot be issued approval tokens."""
-    hard_block_pid = await _setup_hard_block_proposal()
+    headers, principal_id = await _auth_header(client)
+    hard_block_pid = await _setup_hard_block_proposal(owner_user_id=principal_id)
 
     response = await client.post(
         f"/api/v1/proposals/{hard_block_pid}/approval-token",
-        json={"proposal_id": hard_block_pid, "user_session_id": "sess_user_alpha"},
+        json={"proposal_id": hard_block_pid},
+        headers=headers,
     )
     assert response.status_code == 400
     assert "Hard BLOCK rule P03" in response.json()["detail"]
@@ -135,12 +151,14 @@ async def test_consume_approval_token_success_and_replay_prevention(
     client: httpx.AsyncClient,
 ) -> None:
     """Valid token is consumed, transitions proposal to APPROVED, and rejects replay."""
-    proposal_id, _ = await _setup_soft_approval_proposal()
+    headers, principal_id = await _auth_header(client)
+    proposal_id, _ = await _setup_soft_approval_proposal(owner_user_id=principal_id)
 
     # 1. Issue token
     issue_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approval-token",
-        json={"proposal_id": proposal_id, "user_session_id": "sess_user_beta"},
+        json={"proposal_id": proposal_id},
+        headers=headers,
     )
     assert issue_resp.status_code == 200
     token_data = issue_resp.json()
@@ -149,13 +167,13 @@ async def test_consume_approval_token_success_and_replay_prevention(
     consume_payload = {
         "proposal_id": proposal_id,
         "token": token_data["token"],
-        "user_session_id": "sess_user_beta",
         "issued_at": token_data["issued_at"],
         "nonce": token_data["nonce"],
     }
     consume_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approve",
         json=consume_payload,
+        headers=headers,
     )
     assert consume_resp.status_code == 200
     assert consume_resp.json()["success"] is True
@@ -169,6 +187,7 @@ async def test_consume_approval_token_success_and_replay_prevention(
     replay_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approve",
         json=consume_payload,
+        headers=headers,
     )
     assert replay_resp.status_code == 400
     assert "replay detected" in replay_resp.json()["detail"]
@@ -183,11 +202,13 @@ async def test_consume_approval_token_success_and_replay_prevention(
 @pytest.mark.asyncio
 async def test_consume_approval_token_blocked_by_kill_switch(client: httpx.AsyncClient) -> None:
     """When kill switch is active, approval token consumption fails closed with 503."""
-    proposal_id, _ = await _setup_soft_approval_proposal()
+    headers, principal_id = await _auth_header(client)
+    proposal_id, _ = await _setup_soft_approval_proposal(owner_user_id=principal_id)
 
     issue_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approval-token",
-        json={"proposal_id": proposal_id, "user_session_id": "sess_user_gamma"},
+        json={"proposal_id": proposal_id},
+        headers=headers,
     )
     assert issue_resp.status_code == 200
     token_data = issue_resp.json()
@@ -201,10 +222,10 @@ async def test_consume_approval_token_blocked_by_kill_switch(client: httpx.Async
             json={
                 "proposal_id": proposal_id,
                 "token": token_data["token"],
-                "user_session_id": "sess_user_gamma",
                 "issued_at": token_data["issued_at"],
                 "nonce": token_data["nonce"],
             },
+            headers=headers,
         )
         assert consume_resp.status_code == 503
         assert "Emergency kill switch is engaged" in consume_resp.json()["detail"]
@@ -216,11 +237,13 @@ async def test_consume_approval_token_blocked_by_kill_switch(client: httpx.Async
 @pytest.mark.asyncio
 async def test_consume_approval_token_rejects_altered_nonce(client: httpx.AsyncClient) -> None:
     """Tampering with the nonce invalidates the HMAC signature."""
-    proposal_id, _ = await _setup_soft_approval_proposal()
+    headers, principal_id = await _auth_header(client)
+    proposal_id, _ = await _setup_soft_approval_proposal(owner_user_id=principal_id)
 
     issue_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approval-token",
-        json={"proposal_id": proposal_id, "user_session_id": "sess_user_delta"},
+        json={"proposal_id": proposal_id},
+        headers=headers,
     )
     token_data = issue_resp.json()
 
@@ -229,10 +252,10 @@ async def test_consume_approval_token_rejects_altered_nonce(client: httpx.AsyncC
         json={
             "proposal_id": proposal_id,
             "token": token_data["token"],
-            "user_session_id": "sess_user_delta",
             "issued_at": token_data["issued_at"],
             "nonce": "tampered_nonce_value_1234567890",
         },
+        headers=headers,
     )
     assert consume_resp.status_code == 400
     assert "verification failed" in consume_resp.json()["detail"]
@@ -240,13 +263,19 @@ async def test_consume_approval_token_rejects_altered_nonce(client: httpx.AsyncC
 
 @pytest.mark.asyncio
 async def test_consume_approval_token_rejects_wrong_session(client: httpx.AsyncClient) -> None:
-    """Token presented with a different user session is rejected."""
-    proposal_id, _ = await _setup_soft_approval_proposal()
+    """Token issued to one principal cannot be consumed by an impostor principal (403 Forbidden)."""
+    legit_headers, legit_id = await _auth_header(client)
+    impostor_headers, impostor_id = await _auth_header(client)
+    assert legit_id != impostor_id
+
+    proposal_id, _ = await _setup_soft_approval_proposal(owner_user_id=legit_id)
 
     issue_resp = await client.post(
         f"/api/v1/proposals/{proposal_id}/approval-token",
-        json={"proposal_id": proposal_id, "user_session_id": "sess_user_legit"},
+        json={"proposal_id": proposal_id},
+        headers=legit_headers,
     )
+    assert issue_resp.status_code == 200
     token_data = issue_resp.json()
 
     consume_resp = await client.post(
@@ -254,10 +283,31 @@ async def test_consume_approval_token_rejects_wrong_session(client: httpx.AsyncC
         json={
             "proposal_id": proposal_id,
             "token": token_data["token"],
-            "user_session_id": "sess_user_impostor",
             "issued_at": token_data["issued_at"],
             "nonce": token_data["nonce"],
         },
+        headers=impostor_headers,
     )
-    assert consume_resp.status_code == 400
-    assert "verification failed" in consume_resp.json()["detail"]
+    assert consume_resp.status_code == 403
+    assert "Forbidden" in consume_resp.json()["detail"]
+
+    issue_resp = await client.post(
+        f"/api/v1/proposals/{proposal_id}/approval-token",
+        json={"proposal_id": proposal_id},
+        headers=legit_headers,
+    )
+    assert issue_resp.status_code == 200
+    token_data = issue_resp.json()
+
+    consume_resp = await client.post(
+        f"/api/v1/proposals/{proposal_id}/approve",
+        json={
+            "proposal_id": proposal_id,
+            "token": token_data["token"],
+            "issued_at": token_data["issued_at"],
+            "nonce": token_data["nonce"],
+        },
+        headers=impostor_headers,
+    )
+    assert consume_resp.status_code == 403
+    assert "Forbidden" in consume_resp.json()["detail"]

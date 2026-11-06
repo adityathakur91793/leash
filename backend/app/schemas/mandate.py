@@ -209,6 +209,10 @@ class Mandate(MandateBase):
         default=None,
         description="Cryptographic algorithm used for signing (e.g. HMAC-SHA256).",
     )
+    owner_user_id: str | None = Field(
+        default=None,
+        description="Identifier of the authenticated user session that owns the mandate.",
+    )
 
     @field_validator("created_at", mode="after")
     @classmethod

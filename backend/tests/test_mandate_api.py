@@ -25,10 +25,26 @@ def _sample_api_payload() -> dict:
     }
 
 
-async def test_api_create_mandate_success(client: httpx.AsyncClient) -> None:
-    """Test POST /api/v1/mandates creates a draft mandate."""
+async def _get_auth_headers(
+    client: httpx.AsyncClient,
+) -> dict[str, str]:
+    resp = await client.post("/api/v1/sessions", json={})
+    token = resp.json()["session_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_api_create_mandate_requires_auth(client: httpx.AsyncClient) -> None:
+    """Test POST /api/v1/mandates requires authenticated session."""
     payload = _sample_api_payload()
     response = await client.post("/api/v1/mandates", json=payload)
+    assert response.status_code == 401
+
+
+async def test_api_create_mandate_success(client: httpx.AsyncClient) -> None:
+    """Test POST /api/v1/mandates creates a draft mandate."""
+    headers = await _get_auth_headers(client)
+    payload = _sample_api_payload()
+    response = await client.post("/api/v1/mandates", json=payload, headers=headers)
     assert response.status_code == 201
     data = response.json()
     assert data["status"] == "DRAFT"
@@ -36,20 +52,26 @@ async def test_api_create_mandate_success(client: httpx.AsyncClient) -> None:
     assert data["max_total_budget"] == "40.00"
     assert data["mandate_id"].startswith("man_")
     assert data["signature"] is None
+    assert data["owner_user_id"] is not None
+    assert data["owner_user_id"].startswith("usr_")
 
 
 async def test_api_create_mandate_invalid_payload(client: httpx.AsyncClient) -> None:
     """Test POST /api/v1/mandates rejects invalid input."""
+    headers = await _get_auth_headers(client)
     payload = _sample_api_payload()
     payload["max_total_budget"] = "-5.00"
-    response = await client.post("/api/v1/mandates", json=payload)
+    response = await client.post("/api/v1/mandates", json=payload, headers=headers)
     assert response.status_code == 422
 
 
 async def test_api_full_mandate_workflow(client: httpx.AsyncClient) -> None:
     """Test end-to-end API lifecycle: create -> confirm -> sign -> activate -> verify -> revoke."""
+    headers = await _get_auth_headers(client)
     # 1. Create Draft
-    create_res = await client.post("/api/v1/mandates", json=_sample_api_payload())
+    create_res = await client.post(
+        "/api/v1/mandates", json=_sample_api_payload(), headers=headers
+    )
     assert create_res.status_code == 201
     mandate_id = create_res.json()["mandate_id"]
 
@@ -104,9 +126,10 @@ async def test_api_get_nonexistent_mandate(client: httpx.AsyncClient) -> None:
 
 async def test_api_list_mandates(client: httpx.AsyncClient) -> None:
     """Test GET /api/v1/mandates lists created mandates."""
+    headers = await _get_auth_headers(client)
     # Create two mandates
-    await client.post("/api/v1/mandates", json=_sample_api_payload())
-    await client.post("/api/v1/mandates", json=_sample_api_payload())
+    await client.post("/api/v1/mandates", json=_sample_api_payload(), headers=headers)
+    await client.post("/api/v1/mandates", json=_sample_api_payload(), headers=headers)
 
     response = await client.get("/api/v1/mandates?limit=10")
     assert response.status_code == 200
@@ -125,7 +148,10 @@ async def test_api_list_mandates_limit_bounds(client: httpx.AsyncClient) -> None
 
 async def test_api_confirm_non_draft_conflict(client: httpx.AsyncClient) -> None:
     """Test POST /confirm returns 409 when the mandate is not a draft."""
-    create_res = await client.post("/api/v1/mandates", json=_sample_api_payload())
+    headers = await _get_auth_headers(client)
+    create_res = await client.post(
+        "/api/v1/mandates", json=_sample_api_payload(), headers=headers
+    )
     mandate_id = create_res.json()["mandate_id"]
     first = await client.post(f"/api/v1/mandates/{mandate_id}/confirm")
     assert first.status_code == 200
@@ -139,7 +165,10 @@ async def test_api_activate_tampered_mandate(client: httpx.AsyncClient) -> None:
 
     from app.db.database import get_db_path
 
-    create_res = await client.post("/api/v1/mandates", json=_sample_api_payload())
+    headers = await _get_auth_headers(client)
+    create_res = await client.post(
+        "/api/v1/mandates", json=_sample_api_payload(), headers=headers
+    )
     mandate_id = create_res.json()["mandate_id"]
     await client.post(f"/api/v1/mandates/{mandate_id}/confirm")
     sign_res = await client.post(f"/api/v1/mandates/{mandate_id}/sign")

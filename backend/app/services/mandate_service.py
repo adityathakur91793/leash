@@ -60,8 +60,18 @@ async def _expire_if_needed(
     return mandate
 
 
-async def create_draft_mandate(data: MandateCreate) -> Mandate:
-    """Create and persist a new mandate in DRAFT status."""
+async def create_draft_mandate(
+    data: MandateCreate, owner_user_id: str | None = None
+) -> Mandate:
+    """Create and persist a new mandate in DRAFT status.
+
+    Args:
+        data: Validated mandate creation parameters.
+        owner_user_id: Principal identifier of the authenticated session that
+            created this mandate. Set at creation and permanently immutable.
+            Mandates without an owner (NULL) will fail closed for approval
+            token issuance and consumption.
+    """
     created = datetime.now(timezone.utc)
 
     mandate = Mandate(
@@ -82,6 +92,7 @@ async def create_draft_mandate(data: MandateCreate) -> Mandate:
         signature=None,
         signed_at=None,
         signature_algorithm=None,
+        owner_user_id=owner_user_id,
     )
 
     # Atomically persist draft mandate and audit record within one transaction

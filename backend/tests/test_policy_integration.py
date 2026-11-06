@@ -356,6 +356,10 @@ async def test_int_10_concurrent_spend_reservation() -> None:
 # --- API Endpoint Test ---
 async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None:
     """POST /api/v1/proposals/{proposal_id}/evaluate returns PolicyDecision."""
+    # Obtain authenticated session for mandate creation
+    sess_res = await client.post("/api/v1/sessions", json={})
+    auth_headers = {"Authorization": f"Bearer {sess_res.json()['session_token']}"}
+
     # Create mandate via API
     mandate_res = await client.post(
         "/api/v1/mandates",
@@ -369,6 +373,7 @@ async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None
             "require_user_approval": False,
             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
         },
+        headers=auth_headers,
     )
     mandate_id = mandate_res.json()["mandate_id"]
     await client.post(f"/api/v1/mandates/{mandate_id}/confirm")

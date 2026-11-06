@@ -387,6 +387,35 @@ async def init_db() -> None:
                     (1, genesis_entry_hash, genesis_ts, "SYSTEM_INIT", genesis_sig),
                 )
 
+        # Migration 6: User sessions and mandate ownership
+        if current_version < 6:
+            # user_sessions table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    session_token_hash  TEXT PRIMARY KEY,
+                    user_id             TEXT NOT NULL,
+                    created_at          TEXT NOT NULL,
+                    expires_at          TEXT NOT NULL,
+                    revoked_at          TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id "
+                "ON user_sessions(user_id)"
+            )
+            # Add owner_user_id column to mandates (idempotent)
+            try:
+                await db.execute("ALTER TABLE mandates ADD COLUMN owner_user_id TEXT")
+            except aiosqlite.OperationalError:
+                pass  # Column already exists (idempotent re-run)
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (6, datetime('now'))"
+            )
+            current_version = 6
+            logger.info(
+                "Applied migration version 6 (user_sessions, mandate owner_user_id)"
+            )
+
         await db.commit()
 
     logger.info("Database initialisation complete")
@@ -400,14 +429,17 @@ async def save_mandate_to_db(
     Immutable permissions are preserved; only lifecycle status and signature
     metadata are updated if the record already exists.
     """
+    # owner_user_id is set at creation and must remain immutable thereafter.
+    # The ON CONFLICT clause deliberately omits owner_user_id so that subsequent
+    # upserts (e.g. status updates) cannot overwrite the original ownership record.
     query = """
         INSERT INTO mandates (
             mandate_id, schema_version, status, currency, max_total_budget,
             max_price_per_item, max_item_count, max_quantity_per_item,
             allow_subscriptions, require_user_approval, allowed_merchants,
             allowed_categories, created_at, expires_at, signature,
-            signed_at, signature_algorithm
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            signed_at, signature_algorithm, owner_user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(mandate_id) DO UPDATE SET
             status = excluded.status,
             signature = excluded.signature,
@@ -440,6 +472,7 @@ async def save_mandate_to_db(
             else None
         ),
         mandate.signature_algorithm,
+        mandate.owner_user_id,
     )
     if db is not None:
         await db.execute(query, params)
@@ -454,6 +487,11 @@ def _row_to_mandate(row: aiosqlite.Row) -> Mandate:
     """Map a SQLite row to a Mandate model."""
     max_price = row["max_price_per_item"]
     signed_at = row["signed_at"]
+    # owner_user_id was added in migration 6; handle rows from pre-migration DBs.
+    try:
+        owner_user_id = row["owner_user_id"]
+    except (IndexError, KeyError):
+        owner_user_id = None
     return Mandate(
         mandate_id=row["mandate_id"],
         schema_version=row["schema_version"],
@@ -472,6 +510,7 @@ def _row_to_mandate(row: aiosqlite.Row) -> Mandate:
         signature=row["signature"],
         signed_at=datetime.fromisoformat(signed_at) if signed_at else None,
         signature_algorithm=row["signature_algorithm"],
+        owner_user_id=owner_user_id,
     )
 
 
@@ -1291,3 +1330,89 @@ async def get_latest_audit_checkpoint(
         async with conn.execute(query) as cursor:
             row = await cursor.fetchone()
             return _row_to_checkpoint(row) if row is not None else None
+
+
+
+async def create_session_in_db(
+    token_hash: str,
+    user_id: str,
+    created_at_iso: str,
+    expires_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> None:
+    """Persist a new session record. Only the token hash is stored.
+
+    Args:
+        token_hash: SHA-256 hex digest of the raw bearer token.
+        user_id: Principal identifier bound to this session.
+        created_at_iso: ISO-8601 UTC creation timestamp.
+        expires_at_iso: ISO-8601 UTC expiration timestamp.
+        db: Optional existing connection. If None a new connection is opened.
+    """
+    query = """
+        INSERT INTO user_sessions (session_token_hash, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+    """
+    params = (token_hash, user_id, created_at_iso, expires_at_iso)
+    if db is not None:
+        await db.execute(query, params)
+        return
+    async with get_connection() as conn:
+        await conn.execute(query, params)
+        await conn.commit()
+
+
+async def get_session_by_hash(
+    token_hash: str,
+    db: aiosqlite.Connection | None = None,
+) -> dict | None:
+    """Retrieve session row by token hash. Returns None if not found.
+
+    Args:
+        token_hash: SHA-256 hex digest of the raw bearer token.
+        db: Optional existing connection. If None a new connection is opened.
+
+    Returns:
+        A plain dict of the session row, or None if no matching row exists.
+    """
+    query = "SELECT * FROM user_sessions WHERE session_token_hash = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (token_hash,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (token_hash,)) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
+
+
+async def revoke_session_in_db(
+    token_hash: str,
+    revoked_at_iso: str,
+    db: aiosqlite.Connection | None = None,
+) -> bool:
+    """Mark a session as revoked. Returns True if a row was updated.
+
+    Args:
+        token_hash: SHA-256 hex digest of the raw bearer token.
+        revoked_at_iso: ISO-8601 UTC revocation timestamp.
+        db: Optional existing connection. If None a new connection is opened.
+
+    Returns:
+        True if the session row was found and updated, False otherwise.
+    """
+    query = """
+        UPDATE user_sessions
+        SET revoked_at = ?
+        WHERE session_token_hash = ? AND revoked_at IS NULL
+    """
+    params = (revoked_at_iso, token_hash)
+    if db is not None:
+        cursor = await db.execute(query, params)
+        return cursor.rowcount > 0
+    async with get_connection() as conn:
+        cursor = await conn.execute(query, params)
+        await conn.commit()
+        return cursor.rowcount > 0
