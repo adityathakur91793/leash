@@ -1,14 +1,14 @@
 :root {
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #12121a;
-  --bg-card: #1a1a2e;
-  --text-primary: #e4e4e7;
-  --text-secondary: #a1a1aa;
-  --accent: #6366f1;
-  --accent-glow: rgba(99, 102, 241, 0.15);
-  --success: #22c55e;
-  --error: #ef4444;
-  --border: #27273a;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f7f4ff;
+  --bg-card: #ffffff;
+  --text-primary: #261d3b;
+  --text-secondary: #716981;
+  --accent: #7047d7;
+  --accent-glow: rgba(112, 71, 215, 0.12);
+  --success: #17865b;
+  --error: #c43e52;
+  --border: #e8e2f1;
   --radius: 12px;
 }
 
@@ -20,7 +20,7 @@
 
 body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background-color: var(--bg-primary);
+  background-color: #fbfaff;
   color: var(--text-primary);
   min-height: 100vh;
 }
@@ -78,6 +78,7 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1.25rem;
+  box-shadow: 0 8px 24px rgba(47, 29, 85, 0.04);
   transition: border-color 0.2s;
 }
 
@@ -160,6 +161,56 @@ body {
   background: var(--bg-secondary);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(47, 29, 85, 0.05);
+}
+
+.session-panel {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  padding: 1rem 1.2rem;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(47, 29, 85, 0.04);
+}
+.session-summary { display: flex; align-items: flex-start; gap: 0.75rem; }
+.session-summary h2 { font-size: 1rem; }
+.session-summary p { color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.25rem; }
+.session-icon.success { color: var(--success); }
+.session-icon.error { color: var(--error); }
+.session-icon.spinning { color: var(--accent); animation: spin 1s linear infinite; }
+.session-actions { display: flex; flex-shrink: 0; }
+.session-actions button, .agent-form button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+}
+.session-actions button {
+  border: 0;
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  color: #fff;
+  background: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.session-actions .secondary-button {
+  color: var(--text-primary);
+  background: #fff;
+  border: 1px solid var(--border);
+}
+.session-loading {
+  margin-top: 2rem;
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 .shopping-heading, .product-title-row {
@@ -208,7 +259,7 @@ body {
 .agent-error { margin-top: 1rem; color: var(--error); }
 .agent-conversation { display: grid; gap: 1rem; margin-top: 1.25rem; }
 .agent-turn { display: grid; gap: 0.75rem; }
-.user-message { text-align: right; color: #c7d2fe; }
+.user-message { text-align: right; color: #5b3ca8; }
 .product-card, .proposal-outcome {
   padding: 1rem;
   background: var(--bg-card);
@@ -222,6 +273,9 @@ body {
 .proposal-outcome { border-color: var(--accent); }
 
 @media (max-width: 600px) {
+  .session-panel { align-items: flex-start; flex-direction: column; }
+  .session-actions { width: 100%; }
+  .session-actions button { width: 100%; }
   .shopping-agent { padding: 1rem; }
   .shopping-heading { align-items: flex-start; flex-direction: column; }
   .product-card dl div { flex-direction: column; gap: 0.1rem; }

@@ -1,27 +1,37 @@
 import { useEffect, useState } from 'react';
-import { listShoppingMandates, getShoppingSession, sendShoppingMessage } from '../services/api';
+import { ApiError, listShoppingMandates, sendShoppingMessage } from '../services/api';
 
-export function ShoppingAgent() {
-  const [token, setToken] = useState('');
+export function ShoppingAgent({ token, onSessionExpired }) {
   const [mandates, setMandates] = useState([]);
   const [mandateId, setMandateId] = useState('');
   const [message, setMessage] = useState('');
   const [conversation, setConversation] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [loadingMandates, setLoadingMandates] = useState(false);
 
   useEffect(() => {
     let mounted = true;
-    getShoppingSession()
-      .then((sessionToken) => Promise.all([sessionToken, listShoppingMandates(sessionToken)]))
-      .then(([sessionToken, owned]) => {
-        if (!mounted) return;
-        setToken(sessionToken);
-        setMandates(owned);
+    if (!token) {
+      setMandates([]);
+      setMandateId('');
+      return () => { mounted = false; };
+    }
+    setError('');
+    setMandates([]);
+    setLoadingMandates(true);
+    listShoppingMandates(token)
+      .then((owned) => {
+        if (mounted) setMandates(owned || []);
       })
-      .catch((err) => mounted && setError(err.message));
+      .catch((err) => {
+        if (!mounted) return;
+        setError(err.message);
+        if (err instanceof ApiError && err.code === 'unauthenticated') onSessionExpired();
+      })
+      .finally(() => mounted && setLoadingMandates(false));
     return () => { mounted = false; };
-  }, []);
+  }, [token, onSessionExpired]);
 
   async function submit(event) {
     event.preventDefault();
@@ -34,7 +44,8 @@ export function ShoppingAgent() {
       const result = await sendShoppingMessage(token, sent, mandateId);
       setConversation((items) => [...items, { sent, result }]);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'The request could not be completed. Please try again.');
+      if (err instanceof ApiError && err.code === 'unauthenticated') onSessionExpired();
       setMessage(sent);
     } finally {
       setBusy(false);
@@ -61,7 +72,8 @@ export function ShoppingAgent() {
           ))}
         </select>
       </label>
-      {mandates.length === 0 && <p className="agent-note">No owned active mandate is available. You can still search the simulated catalogue.</p>}
+      {loadingMandates && <p className="agent-note" role="status">Loading your active mandates…</p>}
+      {!loadingMandates && mandates.length === 0 && <p className="agent-note">No owned active mandate is available. You can still search the simulated catalogue.</p>}
       <form className="agent-form" onSubmit={submit}>
         <label htmlFor="shopping-message">What are you looking for?</label>
         <textarea id="shopping-message" value={message} maxLength={1500} onChange={(event) => setMessage(event.target.value)} placeholder="For example: find an outdoor bottle under $30" />
