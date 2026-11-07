@@ -34,13 +34,22 @@ from app.main import app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-async def init_test_db() -> AsyncIterator[None]:
+async def init_test_db(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
     """Ensure the temporary test database schema is initialized before tests run."""
+    from app.schemas.intent_audit import IntentAuditorResult
+    from app.services.intent_auditor_client import IntentAuditorClient
+
+    async def local_low_risk_assessment(self, payload):
+        """Keep legacy integration tests deterministic and fully offline."""
+        return IntentAuditorResult(schema_version="1.0", risk_level="LOW")
+
+    monkeypatch.setattr(IntentAuditorClient, "assess", local_low_risk_assessment)
     await init_db()
     yield
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("DELETE FROM paypal_orders")
+        await db.execute("DELETE FROM intent_assessments")
         await db.execute("DELETE FROM audit_checkpoints")
         await db.execute("DELETE FROM audit_logs")
         await db.execute("DELETE FROM approval_tokens")

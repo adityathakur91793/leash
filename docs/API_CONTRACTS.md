@@ -282,6 +282,15 @@ status is recorded separately in later phases and is not a payment instruction.
 
 ---
 
+## Proposal evaluation and Intent Auditor (Phase 5)
+
+`POST /api/v1/proposals/{proposal_id}/evaluate` requires the owning authenticated
+session. Deterministic policy executes first. BLOCK remains final. Other outcomes
+are assessed by the no-tools Intent Auditor; LOW preserves policy behavior,
+MEDIUM/HIGH remain in EVALUATED for user review, and UNCERTAIN/provider failure
+returns a safe service-unavailable response without enabling approval or payment.
+Assessment detail is bounded and does not expose provider prompts or secrets.
+
 ## Phase 2C+ Endpoints (Planned)
 
 ### POST /api/v1/policies

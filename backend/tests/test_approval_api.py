@@ -18,7 +18,7 @@ from app.services.mandate_service import (
     create_draft_mandate,
     sign_mandate,
 )
-from app.services.proposal_service import create_proposal
+from app.services.proposal_service import create_proposal, evaluate_proposal_service
 
 
 async def _auth_header(client: httpx.AsyncClient) -> tuple[dict[str, str], str]:
@@ -66,6 +66,7 @@ async def _setup_soft_approval_proposal(
         product_source="https://bestbuy.com/headphones",
     )
     proposal, _ = await create_proposal(proposal_data)
+    await evaluate_proposal_service(proposal.proposal_id)
     return proposal.proposal_id, mandate.mandate_id
 
 

@@ -17,7 +17,7 @@ from app.services.mandate_service import (
     create_draft_mandate,
     sign_mandate,
 )
-from app.services.proposal_service import create_proposal
+from app.services.proposal_service import create_proposal, evaluate_proposal_service
 
 pytestmark = pytest.mark.asyncio
 
@@ -70,6 +70,7 @@ async def _setup_soft_approval(owner_principal: str) -> tuple[str, str]:
             product_source="https://store.com/gadget",
         )
     )
+    await evaluate_proposal_service(prop.proposal_id)
     return prop.proposal_id, mandate.mandate_id
 
 

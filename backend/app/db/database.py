@@ -465,6 +465,40 @@ async def init_db() -> None:
             current_version = 7
             logger.info("Applied migration version 7 (paypal_orders)")
 
+        # Migration 8: content-bound Intent Auditor assessments (Phase 5).
+        if current_version < 8:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS intent_assessments (
+                    assessment_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL,
+                    mandate_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    finding_codes_json TEXT NOT NULL,
+                    affected_fields_json TEXT NOT NULL,
+                    proposal_content_hash TEXT NOT NULL,
+                    mandate_permissions_hash TEXT NOT NULL,
+                    policy_snapshot_hash TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    model_identifier TEXT NOT NULL,
+                    failure_code TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id),
+                    FOREIGN KEY (mandate_id) REFERENCES mandates(mandate_id)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intent_assessments_proposal "
+                "ON intent_assessments(proposal_id, created_at)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (8, datetime('now'))"
+            )
+            current_version = 8
+            logger.info("Applied migration version 8 (intent_assessments)")
+
         await db.commit()
 
     logger.info("Database initialisation complete")

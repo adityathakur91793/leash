@@ -402,7 +402,9 @@ async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None
     proposal_id = prop_res.json()["proposal_id"]
 
     # Evaluate via API
-    eval_res = await client.post(f"/api/v1/proposals/{proposal_id}/evaluate")
+    eval_res = await client.post(
+        f"/api/v1/proposals/{proposal_id}/evaluate", headers=auth_headers
+    )
     assert eval_res.status_code == 200
     data = eval_res.json()
     assert data["decision"] == "ALLOW"

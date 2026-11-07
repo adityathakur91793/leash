@@ -68,6 +68,12 @@ are preserved. Foreign keys are enforced (`PRAGMA foreign_keys = ON`).
 
 ## Planned Tables (Phase 2C+)
 
+### `intent_assessments` (Migration 8)
+Bounded auditor result and exact proposal, mandate-permission, and policy snapshot
+hashes, schema/prompt/model versions, fixed finding codes, status, and timestamps.
+Raw prompts and unrestricted provider output are not stored. Migration is
+forward-only and uses `CREATE TABLE/INDEX IF NOT EXISTS`.
+
 ### `policies`
 Standing user constraints and authorization policies.
 

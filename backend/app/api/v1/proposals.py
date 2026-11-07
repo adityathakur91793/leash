@@ -4,12 +4,15 @@ Creation, retrieval, and listing only. Authorization and payment are out of
 scope for this resource.
 """
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
+from app.api.dependencies import get_current_session
+from app.schemas.session import UserSession
 
 from app.schemas.policy import PolicyDecision
 from app.schemas.proposal import Proposal, ProposalCreate
 from app.services.mandate_service import MandateNotFoundError
+from app.services.mandate_service import get_mandate
 from app.services.proposal_service import (
     CurrencyMismatchError,
     DuplicateProposalConflictError,
@@ -20,6 +23,7 @@ from app.services.proposal_service import (
     get_proposal,
     list_proposals,
 )
+from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 router = APIRouter(prefix="/proposals", tags=["Proposals"])
 
@@ -92,9 +96,19 @@ async def get_proposal_endpoint(proposal_id: str) -> Proposal:
 
 
 @router.post("/{proposal_id}/evaluate", response_model=PolicyDecision)
-async def evaluate_proposal_endpoint(proposal_id: str) -> PolicyDecision:
-    """Evaluate a stored purchase proposal against its mandate using the policy engine."""
+async def evaluate_proposal_endpoint(
+    proposal_id: str, session: UserSession = Depends(get_current_session)
+) -> PolicyDecision:
+    """Evaluate only a proposal owned by the authenticated session principal."""
     try:
+        proposal = await get_proposal(proposal_id)
+        mandate = await get_mandate(proposal.mandate_id)
+        if not mandate.owner_user_id or mandate.owner_user_id != session.user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="The authenticated principal does not own this proposal.")
         return await evaluate_proposal_service(proposal_id)
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Intent assessment is unavailable; proposal remains on hold.") from exc
     except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc

@@ -23,5 +23,13 @@
 - [x] React Shopping Agent interface with simulated-data and policy outcome labels.
 - [x] Focused security tests and Phase 4 documentation.
 
-## Phase 5: Future work
-- Not started. Requires separate approval and planning.
+## Phase 5: Intent Auditor (implementation in review)
+- [x] Independent no-tools auditor with strict fixed output schema.
+- [x] Deterministic BLOCK-before-AI lifecycle and EVALUATED hold until assessment.
+- [x] Content-bound assessment records and hash-chain audit events (Migration 8).
+- [x] Independent assessment checks at approval and payment boundaries.
+- [x] MEDIUM/HIGH require existing user approval; UNCERTAIN/outages fail closed.
+- [x] Focused tests and architecture/security/API/schema documentation.
+
+## Phase 6: Future work
+- Not started.

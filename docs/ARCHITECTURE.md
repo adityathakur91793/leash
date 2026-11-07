@@ -36,9 +36,9 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 - Pydantic models with strict validation (`extra="forbid"`).
 - Exact Decimal monetary types and UTC timestamps.
 
-## Current State (Phase 4 Shopping Agent)
+## Current State (Phase 5 Intent Auditor)
 - Foundation, mandate, proposal, policy, audit, secure-session, and PayPal Sandbox phases are implemented.
-- SQLite database schema versioning (Version 7).
+- SQLite database schema versioning (Version 8).
 - Mandate subsystem operational:
   - Strict Pydantic validation (budget, currency, merchants, expiration).
   - Deterministic canonical JSON serialization.
@@ -58,3 +58,10 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
   - Proposal tool accepts only a catalogue product ID and quantity; ownership, active mandate signature, expiry, kill switch, and deterministic policy are enforced server-side.
   - Agent modules have no approval-token or payment-executor imports. Proposal evaluation is not payment execution.
   - Product descriptions are HTML-stripped, capped, and heuristically checked for prompt-injection indicators; the heuristic is defense in depth, not a safety guarantee.
+
+## Intent Auditor (Phase 5)
+- The deterministic P01–P12 policy engine runs first. A BLOCK is persisted and returned without an auditor call.
+- Non-BLOCK proposals remain EVALUATED while an independent Gemini client with zero tools reviews minimized structured mandate/proposal summaries.
+- LOW risk preserves the deterministic outcome; MEDIUM/HIGH require the existing authenticated user approval-token lifecycle; UNCERTAIN or unavailable assessment holds progression.
+- Assessments bind immutable proposal content, canonical mandate permissions, and deterministic policy result hashes. Approval and payment services independently validate current bindings.
+- Migration 8 stores bounded structured assessments and audit events; raw prompts and model response text are not persisted.

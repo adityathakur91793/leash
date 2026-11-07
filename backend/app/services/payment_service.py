@@ -226,6 +226,9 @@ async def create_payment_order(
             f"Category '{proposal.category}' is not allowed by mandate."
         )
 
+    from app.services.intent_audit_service import require_current_assessment
+    await require_current_assessment(proposal, mandate, require_human_review=True)
+
     # Check for existing PayPal order for this proposal (Idempotency)
     existing_order = await get_paypal_order_by_proposal_from_db(proposal_id)
     if existing_order is not None:
@@ -290,6 +293,15 @@ async def create_payment_order(
     async with get_connection() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
+            if await is_kill_switch_active(db=conn):
+                raise RuntimeError("Emergency kill switch is active. Payment execution halted.")
+            current_proposal = await get_proposal_from_db(proposal_id, db=conn)
+            current_mandate = await get_mandate_from_db(mandate.mandate_id, db=conn)
+            if current_proposal is None or current_mandate is None:
+                raise PaymentProposalNotApprovedError("Proposal authorization changed.")
+            await require_current_assessment(
+                current_proposal, current_mandate, db=conn, require_human_review=True
+            )
             await insert_paypal_order_in_db(order_record, db=conn)
             await AuditService.append_event(
                 event_type=AuditEventType.PAYMENT_ORDER_CREATED,
@@ -421,6 +433,9 @@ async def capture_payment_order(
             f"expected 'APPROVED'."
         )
 
+    from app.services.intent_audit_service import require_current_assessment
+    await require_current_assessment(proposal, mandate, require_human_review=True)
+
     # TOCTOU Budget revalidation immediately prior to execution
     cumulative_spent = await get_cumulative_mandate_spent(
         mandate.mandate_id, exclude_proposal_id=proposal.proposal_id
@@ -472,6 +487,16 @@ async def capture_payment_order(
     async with get_connection() as conn:
         await conn.execute("BEGIN IMMEDIATE")
         try:
+            if await is_kill_switch_active(db=conn):
+                raise RuntimeError("Emergency kill switch is active. Payment execution halted.")
+            current_proposal = await get_proposal_from_db(proposal.proposal_id, db=conn)
+            current_mandate = await get_mandate_from_db(mandate.mandate_id, db=conn)
+            if current_proposal is None or current_mandate is None:
+                raise PaymentProposalNotApprovedError("Proposal authorization changed before capture.")
+            from app.services.intent_audit_service import require_current_assessment
+            await require_current_assessment(
+                current_proposal, current_mandate, db=conn, require_human_review=True
+            )
             if paypal_status == "APPROVED":
                 if await is_kill_switch_active(db=conn):
                     raise RuntimeError("Emergency kill switch is active. Payment execution halted.")

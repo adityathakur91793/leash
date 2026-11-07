@@ -36,6 +36,7 @@ from app.services.paypal_service import (
     PayPalOrderError,
 )
 from app.services.proposal_service import CurrencyMismatchError, ProposalNotFoundError
+from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ def _handle_payment_exceptions(exc: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, RuntimeError):
         return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    if isinstance(exc, IntentAuditorUnavailable):
+        return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                             detail="A current valid intent assessment is required.")
     if isinstance(
         exc,
         (

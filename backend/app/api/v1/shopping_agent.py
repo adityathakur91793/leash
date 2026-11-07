@@ -27,6 +27,7 @@ from app.services.shopping_agent_service import (
     ShoppingAgentOwnershipError,
     run_shopping_agent,
 )
+from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 router = APIRouter(prefix="/shopping-agent", tags=["Shopping Agent"])
 
@@ -90,6 +91,11 @@ async def chat(
         raise HTTPException(
             status_code=502,
             detail="Shopping Agent provider is unavailable.",
+        ) from exc
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Intent assessment is unavailable; proposal remains on hold.",
         ) from exc
     except ShoppingAgentBlockedError as exc:
         raise HTTPException(

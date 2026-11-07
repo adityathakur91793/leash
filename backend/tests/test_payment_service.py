@@ -52,6 +52,8 @@ def test_unconfirmed_or_mismatched_capture_never_settles(response) -> None:
 @pytest.mark.asyncio
 async def test_ambiguous_capture_is_reconciled_without_blind_retry(monkeypatch) -> None:
     from app.services import payment_service as service
+    from app.services import intent_audit_service
+    monkeypatch.setattr(intent_audit_service, "require_current_assessment", _async_value({"status": "VALID", "risk_level": "LOW"}))
 
     now = datetime.now(timezone.utc)
     order = SimpleNamespace(
@@ -109,6 +111,8 @@ async def test_ambiguous_capture_is_reconciled_without_blind_retry(monkeypatch) 
 @pytest.mark.asyncio
 async def test_capture_finalization_stops_if_order_update_loses_race(monkeypatch) -> None:
     from app.services import payment_service as service
+    from app.services import intent_audit_service
+    monkeypatch.setattr(intent_audit_service, "require_current_assessment", _async_value({"status": "VALID", "risk_level": "LOW"}))
 
     now = datetime.now(timezone.utc)
     order = SimpleNamespace(

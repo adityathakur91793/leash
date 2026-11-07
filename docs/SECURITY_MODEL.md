@@ -127,3 +127,20 @@ evaluation outcome, not a payment execution.
   transmitted in the provider API key header, and excluded from prompts,
   frontend configuration, and application logs. The React app sends only its
   session Bearer token using `VITE_API_URL`.
+
+## Intent Auditor Boundary (Phase 5)
+
+- Deterministic policy runs first and a BLOCK skips Gemini. The auditor uses an
+  independent client with no registered tools and receives only bounded,
+  structured mandate permissions and proposal commercial summaries.
+- Owner/session IDs, signatures, user conversation, product sources/descriptions,
+  approval tokens, payment identifiers, and all credentials are excluded.
+- Strict Pydantic output contains only a schema version, risk enum, fixed finding
+  codes, and allowlisted affected fields. It cannot express approval or override.
+- MEDIUM/HIGH require user approval through the existing token lifecycle;
+  UNCERTAIN, malformed/provider failures, missing or stale bindings fail closed.
+- Approval issuance/consumption and payment order/capture independently verify
+  assessment content hashes, current mandate permissions, and the P01–P12 snapshot.
+- The auditor never imports Shopping Agent tools, approval services, payment
+  services, or PayPal. Input sanitization and model risk classification are
+  defense in depth, not guarantees against prompt injection.

@@ -24,6 +24,7 @@ from app.services.approval_service import (
 )
 from app.services.mandate_service import MandateNotFoundError
 from app.services.proposal_service import ProposalNotFoundError, ProposalTamperedError
+from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,9 @@ async def issue_approval_token_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="A current valid intent assessment is required.") from exc
     except (OwnerlessMandateError, MandateOwnershipError) as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

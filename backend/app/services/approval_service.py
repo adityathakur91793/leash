@@ -27,6 +27,7 @@ from app.db.database import (
     get_proposal_by_fingerprint,
     get_proposal_by_idempotency_key,
     get_today_reserved_spend,
+    is_kill_switch_active,
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.policy import DecisionOutcome, EvaluationContext, RuleStatus
@@ -80,9 +81,11 @@ async def issue_approval_token(
     """
     if not settings.MANDATE_SIGNING_KEY:
         raise ValueError("Signing key not configured.")
+    await enforce_kill_switch_guard()
 
     proposal = await get_proposal(proposal_id)
     mandate = await get_mandate(proposal.mandate_id)
+
 
     # Ownership check: fail closed for ownerless mandates and wrong principal
     if mandate.owner_user_id is None:
@@ -143,6 +146,11 @@ async def issue_approval_token(
             "Policy evaluation resulted in BLOCK; approval token not issued."
         )
 
+    from app.services.intent_audit_service import require_current_assessment
+    await require_current_assessment(proposal, mandate)
+    if proposal.status != ProposalStatus.EVALUATED:
+        raise ValueError("Only evaluated proposals requiring user review may receive a token.")
+
     issued_at = datetime.now(timezone.utc)
     expires_at = issued_at + timedelta(seconds=_TOKEN_TTL_SECONDS)
     nonce = secrets.token_hex(16)
@@ -160,6 +168,13 @@ async def issue_approval_token(
     async with get_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
+            if await is_kill_switch_active(db=db):
+                raise RuntimeError("Emergency kill switch is active. Approval halted.")
+            current_proposal = await get_proposal(proposal_id, db=db)
+            current_mandate = await get_mandate(current_proposal.mandate_id, db=db)
+            assessment = await require_current_assessment(current_proposal, current_mandate, db=db)
+            if current_proposal.status != ProposalStatus.EVALUATED:
+                raise ValueError("Proposal is no longer awaiting user review.")
             await register_approval_token(
                 token=token,
                 proposal_id=proposal_id,
@@ -278,6 +293,13 @@ async def consume_approval_token(
         existing_by_idempotency_key=existing_ik,
     )
 
+    from app.services.intent_audit_service import require_current_assessment
+    try:
+        await require_current_assessment(proposal, mandate)
+    except Exception as exc:
+        await _record_consume_failure_audit(proposal_id, principal_id, "Intent assessment missing or stale.")
+        return False, "A current valid intent assessment is required."
+
     # 3. Check no hard BLOCK rules
     if decision.decision == DecisionOutcome.BLOCK:
         for rule in decision.rules:
@@ -307,6 +329,11 @@ async def consume_approval_token(
     async with get_connection() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
+            if await is_kill_switch_active(db=db):
+                raise RuntimeError("Emergency kill switch is active. Approval halted.")
+            current_proposal = await get_proposal(proposal_id, db=db)
+            current_mandate = await get_mandate(current_proposal.mandate_id, db=db)
+            await require_current_assessment(current_proposal, current_mandate, db=db)
             success, reason = await verify_and_consume_approval_token(
                 token=token,
                 proposal_id=proposal_id,
@@ -323,8 +350,12 @@ async def consume_approval_token(
                 await _record_consume_failure_audit(proposal_id, principal_id, reason)
                 return False, reason
 
+            if current_proposal.status != ProposalStatus.EVALUATED:
+                await db.rollback()
+                return False, "Proposal is no longer awaiting user review."
+
             # Token consumed successfully — update proposal status if applicable
-            await db.execute(
+            cursor = await db.execute(
                 """
                 UPDATE proposals
                 SET status = ?
@@ -332,6 +363,8 @@ async def consume_approval_token(
                 """,
                 (ProposalStatus.APPROVED.value, proposal_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Proposal approval state changed concurrently.")
 
             # Atomically append EXCEPTION_APPROVED audit event in the same transaction
             await AuditService.append_event(

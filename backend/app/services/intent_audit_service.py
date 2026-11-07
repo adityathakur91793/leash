@@ -1,0 +1,386 @@
+"""Content-bound Intent Auditor orchestration and independent gate checks."""
+
+import hashlib
+import html
+import json
+import re
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
+from enum import Enum
+
+import aiosqlite
+
+from app.core.config import settings
+from app.db.database import (
+    get_connection,
+    get_cumulative_mandate_spent,
+    get_proposal_by_fingerprint,
+    get_proposal_by_idempotency_key,
+    get_today_reserved_spend,
+    is_kill_switch_active,
+)
+from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
+from app.schemas.intent_audit import (
+    IntentAssessmentStatus,
+    IntentAuditorInput,
+    IntentAuditorPolicyRule,
+    IntentAuditorResult,
+    IntentMandateSummary,
+    IntentProposalSummary,
+    IntentRiskLevel,
+)
+from app.schemas.mandate import Mandate
+from app.schemas.policy import DecisionOutcome, EvaluationContext, OracleResult, PolicyDecision
+from app.schemas.proposal import Proposal
+from app.services.audit_service import AuditService
+from app.services.intent_auditor_client import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
+    IntentAuditorClient,
+    IntentAuditorUnavailable,
+)
+from app.services.kill_switch_service import enforce_kill_switch_guard
+from app.services.mandate_service import get_mandate
+from app.services.policy_engine import evaluate_policy
+from app.services.proposal_service import get_proposal
+
+POLICY_VERSION = "P01-P12-v1"
+_EXCLUDED_EVIDENCE_KEY_PARTS = (
+    "secret", "credential", "token", "session", "owner", "user", "email",
+    "signature", "paypal", "fingerprint", "idempotency", "product_source",
+    "product_id", "url", "address", "phone",
+)
+_INJECTION = re.compile(
+    r"ignore.{0,50}(instruction|prompt|rules)|system prompt|developer message|"
+    r"tool call|reveal.{0,20}(secret|credential)|disregard.{0,30}(instruction|prompt)",
+    re.IGNORECASE,
+)
+
+
+class DeterministicBlockDetected(Exception):
+    """Raised after a post-model policy recheck persists a new BLOCK."""
+
+    def __init__(self, decision: PolicyDecision) -> None:
+        self.decision = decision
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def mandate_permissions_hash(mandate: object) -> str:
+    return _sha(mandate.canonical_payload())
+
+
+def policy_snapshot_hash(decision: PolicyDecision) -> str:
+    """Hash deterministic policy outcomes and sanitized, canonical evidence."""
+    stable = {
+        "decision": decision.decision.value,
+        "rules": [
+            {
+                "rule_id": rule.rule_id,
+                "status": rule.status.value,
+                "evidence": _canonical_policy_evidence(rule.evidence),
+            }
+            for rule in sorted(decision.rules, key=lambda item: item.rule_id)
+        ],
+        "version": POLICY_VERSION,
+    }
+    serialized = json.dumps(
+        stable, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return _sha(serialized)
+
+
+def _canonical_policy_evidence(value: object) -> object:
+    """Normalize evidence without floats, secrets, identifiers, or unbounded text."""
+    if isinstance(value, dict):
+        normalized: dict[str, object] = {}
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if (len(key_text) > 80 or key_lower.endswith("_id")
+                    or any(part in key_lower for part in _EXCLUDED_EVIDENCE_KEY_PARTS)):
+                continue
+            normalized[key_text] = _canonical_policy_evidence(item)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        if len(value) > 64:
+            raise ValueError("Policy evidence list exceeds its canonicalization limit.")
+        normalized_values = [_canonical_policy_evidence(item) for item in value]
+        return sorted(
+            normalized_values,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        )
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("Non-finite Decimal policy evidence is invalid.")
+        return format(value, "f")
+    if isinstance(value, float):
+        decimal_value = Decimal(str(value))
+        if not decimal_value.is_finite():
+            raise ValueError("Non-finite floating policy evidence is invalid.")
+        return format(decimal_value, "f")
+    if isinstance(value, Enum):
+        return _canonical_policy_evidence(value.value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError("Naive datetime policy evidence is invalid.")
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, str):
+        if len(value) > 512:
+            return {"length": len(value), "sha256": _sha(value)}
+        return value
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    raise TypeError(f"Unsupported policy evidence type: {type(value).__name__}")
+
+
+def _safe_text(value: str, limit: int) -> str:
+    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", value,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = html.unescape(re.sub(r"<[^>]*>", " ", text))
+    text = " ".join(text.split())[:limit]
+    if _INJECTION.search(text):
+        return "[untrusted text omitted]"
+    return text
+
+
+async def current_policy_decision(
+    proposal: Proposal, mandate: Mandate, *, now: datetime | None = None,
+    db: aiosqlite.Connection | None = None, daily_limit: Decimal | None = None,
+    oracle_result: OracleResult | None = None,
+) -> PolicyDecision:
+    """Recompute all policy rules for a proposal using current spend and duplicate state."""
+    when = now or datetime.now(timezone.utc)
+    async def evaluate(conn: aiosqlite.Connection) -> PolicyDecision:
+        today = await get_today_reserved_spend(
+            mandate.mandate_id, when.date().isoformat(),
+            exclude_proposal_id=proposal.proposal_id, db=conn,
+        )
+        spent = await get_cumulative_mandate_spent(
+            mandate.mandate_id, exclude_proposal_id=proposal.proposal_id, db=conn,
+        )
+        by_fp = await get_proposal_by_fingerprint(proposal.fingerprint, db=conn)
+        by_key = (await get_proposal_by_idempotency_key(proposal.idempotency_key, db=conn)
+                  if proposal.idempotency_key else None)
+        return evaluate_policy(
+            proposal=proposal, mandate=mandate,
+            context=EvaluationContext(now=when, today_reserved=today,
+                                      cumulative_mandate_spent=spent,
+                                      daily_txn_limit=daily_limit,
+                                      oracle_result=oracle_result),
+            existing_by_fingerprint=by_fp, existing_by_idempotency_key=by_key,
+        )
+    if db is not None:
+        return await evaluate(db)
+    async with get_connection() as conn:
+        return await evaluate(conn)
+
+
+async def make_auditor_input(proposal: Proposal, mandate: Mandate,
+                             decision: PolicyDecision) -> IntentAuditorInput:
+    """Construct the minimized auditor input; internal IDs never leave this function."""
+    expires = mandate.expires_at > datetime.now(timezone.utc)
+    return IntentAuditorInput(
+        mandate=IntentMandateSummary(
+            currency=mandate.currency,
+            max_total_budget=str(mandate.max_total_budget),
+            max_price_per_item=(str(mandate.max_price_per_item)
+                                if mandate.max_price_per_item is not None else None),
+            max_item_count=mandate.max_item_count,
+            max_quantity_per_item=mandate.max_quantity_per_item,
+            allowed_merchants=mandate.allowed_merchants,
+            allowed_categories=mandate.allowed_categories,
+            allow_subscriptions=mandate.allow_subscriptions,
+            require_user_approval=mandate.require_user_approval,
+            is_active_and_unexpired=(mandate.status.value == "ACTIVE" and expires),
+        ),
+        proposal=IntentProposalSummary(
+            product_name=_safe_text(proposal.product_name, 120),
+            merchant=_safe_text(proposal.merchant, 128),
+            category=_safe_text(proposal.category, 64),
+            quantity=proposal.quantity,
+            unit_price=str(proposal.unit_price), total=str(proposal.total),
+            currency=proposal.currency,
+        ),
+        deterministic_outcome=decision.decision.value,
+        policy_rules=[IntentAuditorPolicyRule(rule_id=r.rule_id, status=r.status.value)
+                      for r in decision.rules],
+    )
+
+
+async def assess_and_persist(
+    proposal_id: str, decision: PolicyDecision,
+    *, client: IntentAuditorClient | None = None, daily_limit: Decimal | None = None,
+    oracle_result: OracleResult | None = None,
+) -> IntentAuditorResult:
+    """Assess outside SQLite write locks, then bind and atomically persist current result."""
+    proposal = await get_proposal(proposal_id)
+    mandate = await get_mandate(proposal.mandate_id)
+    p_hash = proposal.content_hash
+    m_hash = mandate_permissions_hash(mandate)
+    policy_hash = policy_snapshot_hash(decision)
+    blocked_decision: PolicyDecision | None = None
+    try:
+        await enforce_kill_switch_guard()
+        payload = await make_auditor_input(proposal, mandate, decision)
+        result = await (client or IntentAuditorClient()).assess(payload)
+        status = IntentAssessmentStatus.VALID
+        failure = None
+    except Exception as exc:
+        result = IntentAuditorResult(schema_version=SCHEMA_VERSION,
+                                    risk_level=IntentRiskLevel.UNCERTAIN)
+        status = IntentAssessmentStatus.FAILED
+        failure = "AUDITOR_UNAVAILABLE" if isinstance(exc, IntentAuditorUnavailable) else "AUDITOR_FAILED"
+
+    async with get_connection() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            current_proposal = await get_proposal(proposal_id, db=db)
+            current_mandate = await get_mandate(current_proposal.mandate_id, db=db)
+            current_decision = await current_policy_decision(
+                current_proposal, current_mandate, db=db, daily_limit=daily_limit,
+                oracle_result=oracle_result,
+            )
+            kill_switch_active = await is_kill_switch_active(db=db)
+            matches = (
+                current_proposal.content_hash == p_hash
+                and mandate_permissions_hash(current_mandate) == m_hash
+                and policy_snapshot_hash(current_decision) == policy_hash
+            )
+            if current_decision.decision == DecisionOutcome.BLOCK:
+                blocked_decision = current_decision
+                status = IntentAssessmentStatus.STALE
+                failure = "POLICY_BLOCKED_DURING_AUDIT"
+                cursor = await db.execute(
+                    "UPDATE proposals SET status = 'REJECTED' WHERE proposal_id = ? "
+                    "AND status IN ('SUBMITTED', 'EVALUATED')", (proposal_id,)
+                )
+                if cursor.rowcount == 1:
+                    await AuditService.append_event(
+                        event_type=AuditEventType.AUTHORIZATION_BLOCKED,
+                        entity_type=AuditEntityType.PROPOSAL, entity_id=proposal_id,
+                        actor=AuditActor.POLICY_ENGINE,
+                        payload={"proposal_id": proposal_id,
+                                 "decision": DecisionOutcome.BLOCK.value,
+                                 "blocking_rules": current_decision.blocking_rules}, db=db,
+                    )
+            elif kill_switch_active:
+                status = IntentAssessmentStatus.FAILED
+                failure = "KILL_SWITCH_ACTIVE"
+                result = IntentAuditorResult(schema_version=SCHEMA_VERSION,
+                                            risk_level=IntentRiskLevel.UNCERTAIN)
+            elif not matches:
+                status = IntentAssessmentStatus.STALE
+                failure = "SNAPSHOT_CHANGED"
+                result = IntentAuditorResult(schema_version=SCHEMA_VERSION,
+                                            risk_level=IntentRiskLevel.UNCERTAIN)
+            elif current_mandate.status.value != "ACTIVE" or current_mandate.expires_at <= datetime.now(timezone.utc):
+                status = IntentAssessmentStatus.FAILED
+                failure = "MANDATE_INACTIVE"
+                result = IntentAuditorResult(schema_version=SCHEMA_VERSION,
+                                            risk_level=IntentRiskLevel.UNCERTAIN)
+            if status == IntentAssessmentStatus.VALID:
+                cursor = await db.execute(
+                    "SELECT risk_level, finding_codes_json, affected_fields_json FROM "
+                    "intent_assessments WHERE proposal_id = ? AND status = 'VALID' "
+                    "AND proposal_content_hash = ? AND mandate_permissions_hash = ? "
+                    "AND policy_snapshot_hash = ? AND schema_version = ? "
+                    "AND prompt_version = ? AND model_identifier = ? "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (proposal_id, p_hash, m_hash, policy_hash, SCHEMA_VERSION,
+                     PROMPT_VERSION, settings.GEMINI_MODEL),
+                )
+                existing = await cursor.fetchone()
+                if existing is not None:
+                    result = IntentAuditorResult(
+                        schema_version=SCHEMA_VERSION, risk_level=existing[0],
+                        finding_codes=json.loads(existing[1]),
+                        affected_fields=json.loads(existing[2]),
+                    )
+                    await db.commit()
+                    return result
+            assessment_id = f"ia_{uuid.uuid4().hex}"
+            created = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                "INSERT INTO intent_assessments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (assessment_id, proposal_id, current_mandate.mandate_id, status.value,
+                 result.risk_level.value,
+                 json.dumps([v.value for v in result.finding_codes]),
+                 json.dumps([v.value for v in result.affected_fields]), p_hash, m_hash,
+                 policy_hash, POLICY_VERSION, SCHEMA_VERSION, PROMPT_VERSION,
+                 __import__("app.core.config", fromlist=["settings"]).settings.GEMINI_MODEL,
+                 failure, created),
+            )
+            event = (AuditEventType.INTENT_ASSESSMENT_COMPLETED
+                     if status == IntentAssessmentStatus.VALID
+                     else AuditEventType.INTENT_ASSESSMENT_FAILED)
+            await AuditService.append_event(
+                event_type=event, entity_type=AuditEntityType.PROPOSAL,
+                entity_id=proposal_id, actor=AuditActor.SYSTEM,
+                payload={"assessment_id": assessment_id, "status": status.value,
+                         "risk_level": result.risk_level.value,
+                         "proposal_content_hash": p_hash,
+                         "mandate_permissions_hash": m_hash,
+                         "policy_snapshot_hash": policy_hash,
+                         "finding_codes": [v.value for v in result.finding_codes]}, db=db,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    if blocked_decision is not None:
+        raise DeterministicBlockDetected(blocked_decision)
+    if status != IntentAssessmentStatus.VALID:
+        raise IntentAuditorUnavailable("Intent assessment could not be safely completed.")
+    return result
+
+
+async def require_current_assessment(proposal: Proposal, mandate: Mandate,
+                                     db: aiosqlite.Connection | None = None,
+                                     daily_limit: Decimal | None = None,
+                                     oracle_result: OracleResult | None = None,
+                                     require_human_review: bool = False) -> dict:
+    """Fail closed unless the latest valid assessment binds current deterministic state."""
+    async def check(conn: aiosqlite.Connection) -> dict:
+        cursor = await conn.execute(
+            "SELECT status, risk_level, proposal_content_hash, mandate_permissions_hash, "
+            "policy_snapshot_hash, schema_version, prompt_version, model_identifier "
+            "FROM intent_assessments WHERE proposal_id = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (proposal.proposal_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None or row[0] != "VALID":
+            raise IntentAuditorUnavailable("A current valid intent assessment is required.")
+        if row[1] == "UNCERTAIN":
+            raise IntentAuditorUnavailable("An uncertain intent assessment cannot authorize progression.")
+        active_versions = (SCHEMA_VERSION, PROMPT_VERSION, settings.GEMINI_MODEL)
+        stored_versions = row[5:8]
+        if (not all(isinstance(version, str) and version for version in stored_versions)
+                or stored_versions != active_versions):
+            raise IntentAuditorUnavailable("The intent assessment uses stale auditor versions.")
+        current = await current_policy_decision(
+            proposal, mandate, db=conn, daily_limit=daily_limit,
+            oracle_result=oracle_result,
+        )
+        if (row[2] != proposal.content_hash
+                or row[3] != mandate_permissions_hash(mandate)
+                or row[4] != policy_snapshot_hash(current)
+                or current.decision == DecisionOutcome.BLOCK):
+            raise IntentAuditorUnavailable("The intent assessment is stale.")
+        if (require_human_review and proposal.status.value == "APPROVED"
+                and (row[1] in {"MEDIUM", "HIGH"}
+                     or current.decision == DecisionOutcome.REQUIRE_APPROVAL)):
+            cursor = await conn.execute(
+                "SELECT 1 FROM approval_tokens WHERE proposal_id = ? "
+                "AND consumed_at IS NOT NULL LIMIT 1", (proposal.proposal_id,)
+            )
+            if await cursor.fetchone() is None:
+                raise IntentAuditorUnavailable("Required user review has not been recorded.")
+        return {"status": row[0], "risk_level": row[1]}
+    if db is not None:
+        return await check(db)
+    async with get_connection() as conn:
+        return await check(conn)
