@@ -42,6 +42,20 @@ _REAL_INTENT_AUDITOR_ASSESS = IntentAuditorClient.assess
 
 
 @pytest.fixture(autouse=True)
+def init_test_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep Attack Lab tests on their own DB instead of initializing the shared DB."""
+    from app.schemas.intent_audit import IntentAuditorResult
+
+    async def local_low_risk_assessment(
+        self: IntentAuditorClient, payload: Any
+    ) -> IntentAuditorResult:
+        """Keep tests without an explicit provider script deterministic and offline."""
+        return IntentAuditorResult(schema_version="1.0", risk_level="LOW")
+
+    monkeypatch.setattr(IntentAuditorClient, "assess", local_low_risk_assessment)
+
+
+@pytest.fixture(autouse=True)
 def attack_lab_safety(monkeypatch: pytest.MonkeyPatch) -> BlockedDestinations:
     """Use dummy provider configuration and deny every unmocked HTTPX transport."""
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "attack-lab-gemini-key")
@@ -128,7 +142,12 @@ async def attack_users(
 @pytest.fixture
 def attack_factories(attack_database: Path) -> dict[str, Any]:
     """Return local mandate and proposal factories using synthetic terms."""
-    async def mandate(owner_user_id: str, *, active: bool = True) -> Mandate:
+    async def mandate(
+        owner_user_id: str,
+        *,
+        active: bool = True,
+        require_user_approval: bool = True,
+    ) -> Mandate:
         created = await create_draft_mandate(
             MandateCreate(
                 max_total_budget=Decimal("100.00"),
@@ -138,7 +157,7 @@ def attack_factories(attack_database: Path) -> dict[str, Any]:
                 max_item_count=3,
                 max_quantity_per_item=2,
                 max_price_per_item=Decimal("50.00"),
-                require_user_approval=True,
+                require_user_approval=require_user_approval,
                 expires_at=datetime.now(timezone.utc) + timedelta(days=2),
             ),
             owner_user_id=owner_user_id,
