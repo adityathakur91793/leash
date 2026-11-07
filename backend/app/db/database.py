@@ -767,6 +767,21 @@ async def get_proposal_from_db(
             return _row_to_proposal(row)
 
 
+async def get_proposal_for_owner_from_db(
+    proposal_id: str, owner_user_id: str
+) -> Proposal | None:
+    """Retrieve a proposal only when its associated mandate has the given owner."""
+    query = (
+        "SELECT p.* FROM proposals AS p "
+        "JOIN mandates AS m ON m.mandate_id = p.mandate_id "
+        "WHERE p.proposal_id = ? AND m.owner_user_id = ?"
+    )
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (proposal_id, owner_user_id)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_proposal(row) if row is not None else None
+
 async def get_proposal_by_fingerprint(
     fingerprint: str, db: aiosqlite.Connection | None = None
 ) -> Proposal | None:
@@ -812,21 +827,29 @@ async def get_proposal_by_idempotency_key(
 
 
 async def list_proposals_from_db(
-    limit: int = 50, mandate_id: str | None = None
+    limit: int = 50,
+    mandate_id: str | None = None,
+    owner_user_id: str | None = None,
 ) -> list[Proposal]:
-    """Retrieve recent proposals, optionally filtered by mandate."""
+    """Retrieve recent proposals with optional mandate and owner filters."""
     async with get_connection() as db:
         db.row_factory = aiosqlite.Row
-        if mandate_id is None:
-            query = "SELECT * FROM proposals ORDER BY created_at DESC LIMIT ?"
-            params: tuple[object, ...] = (limit,)
-        else:
-            query = (
-                "SELECT * FROM proposals WHERE mandate_id = ? "
-                "ORDER BY created_at DESC LIMIT ?"
-            )
-            params = (mandate_id, limit)
-        async with db.execute(query, params) as cursor:
+        filters: list[str] = []
+        params_list: list[object] = []
+        if owner_user_id is not None:
+            filters.append("m.owner_user_id = ?")
+            params_list.append(owner_user_id)
+        if mandate_id is not None:
+            filters.append("p.mandate_id = ?")
+            params_list.append(mandate_id)
+        where = f"WHERE {' AND '.join(filters)} " if filters else ""
+        query = (
+            "SELECT p.* FROM proposals AS p "
+            "JOIN mandates AS m ON m.mandate_id = p.mandate_id "
+            f"{where}ORDER BY p.created_at DESC LIMIT ?"
+        )
+        params_list.append(limit)
+        async with db.execute(query, tuple(params_list)) as cursor:
             rows = await cursor.fetchall()
             return [_row_to_proposal(row) for row in rows]
 

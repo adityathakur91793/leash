@@ -376,9 +376,9 @@ async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None
         headers=auth_headers,
     )
     mandate_id = mandate_res.json()["mandate_id"]
-    await client.post(f"/api/v1/mandates/{mandate_id}/confirm")
-    await client.post(f"/api/v1/mandates/{mandate_id}/sign")
-    await client.post(f"/api/v1/mandates/{mandate_id}/activate")
+    await client.post(f"/api/v1/mandates/{mandate_id}/confirm", headers=auth_headers)
+    await client.post(f"/api/v1/mandates/{mandate_id}/sign", headers=auth_headers)
+    await client.post(f"/api/v1/mandates/{mandate_id}/activate", headers=auth_headers)
 
     # Create proposal via API
     prop_res = await client.post(
@@ -398,6 +398,7 @@ async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None
             "product_source": "https://amazon.com/dp/sku-100",
             "idempotency_key": "api-eval-test-1",
         },
+        headers=auth_headers,
     )
     proposal_id = prop_res.json()["proposal_id"]
 

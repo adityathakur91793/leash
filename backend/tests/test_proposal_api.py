@@ -46,20 +46,20 @@ def _proposal_api_payload(mandate_id: str, **overrides: object) -> dict:
     return payload
 
 
-async def _create_mandate(client: httpx.AsyncClient) -> str:
+async def _create_mandate(client: httpx.AsyncClient) -> tuple[str, dict[str, str]]:
     session_res = await client.post("/api/v1/sessions", json={})
     token = session_res.json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
     response = await client.post("/api/v1/mandates", json=_mandate_api_payload(), headers=headers)
     assert response.status_code == 201
-    return response.json()["mandate_id"]
+    return response.json()["mandate_id"], headers
 
 
 async def test_api_create_proposal_success(client: httpx.AsyncClient) -> None:
     """POST /proposals creates a submitted proposal with server totals."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     response = await client.post(
-        "/api/v1/proposals", json=_proposal_api_payload(mandate_id)
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers
     )
     assert response.status_code == 201
     data = response.json()
@@ -74,93 +74,112 @@ async def test_api_rejects_client_totals_and_unexpected_fields(
     client: httpx.AsyncClient,
 ) -> None:
     """Clients cannot supply totals or authorization fields."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     payload = _proposal_api_payload(mandate_id)
     payload["total"] = "1.00"
-    response = await client.post("/api/v1/proposals", json=payload)
+    response = await client.post("/api/v1/proposals", json=payload, headers=headers)
     assert response.status_code == 422
+
+
+async def test_api_rejects_forged_proposal_owner_user_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """Proposal creation cannot accept a client-supplied owner identity."""
+    mandate_id, headers = await _create_mandate(client)
+    for field in ("owner_user_id", "user_id"):
+        payload = _proposal_api_payload(mandate_id)
+        payload[field] = "usr_attacker_chosen"
+        response = await client.post(
+            "/api/v1/proposals", json=payload, headers=headers
+        )
+        assert response.status_code == 422
 
 
 async def test_api_invalid_price_quantity_currency(client: httpx.AsyncClient) -> None:
     """Invalid money, quantity, and currency values are rejected."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
 
     negative = _proposal_api_payload(mandate_id, unit_price="-1.00")
-    assert (await client.post("/api/v1/proposals", json=negative)).status_code == 422
+    assert (
+        await client.post("/api/v1/proposals", json=negative, headers=headers)
+    ).status_code == 422
 
     qty = _proposal_api_payload(mandate_id, quantity=0)
-    assert (await client.post("/api/v1/proposals", json=qty)).status_code == 422
+    assert (await client.post("/api/v1/proposals", json=qty, headers=headers)).status_code == 422
 
     currency = _proposal_api_payload(mandate_id, currency="usd")
-    assert (await client.post("/api/v1/proposals", json=currency)).status_code == 422
+    assert (
+        await client.post("/api/v1/proposals", json=currency, headers=headers)
+    ).status_code == 422
 
 
 async def test_api_missing_mandate(client: httpx.AsyncClient) -> None:
     """POST /proposals returns 404 when the mandate does not exist."""
+    _, headers = await _create_mandate(client)
     response = await client.post(
-        "/api/v1/proposals", json=_proposal_api_payload("man_missing")
+        "/api/v1/proposals", json=_proposal_api_payload("man_missing"), headers=headers
     )
     assert response.status_code == 404
 
 
 async def test_api_invalid_merchant(client: httpx.AsyncClient) -> None:
     """Malformed merchant identifiers are rejected."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     payload = _proposal_api_payload(mandate_id, merchant="https://amazon.com")
-    response = await client.post("/api/v1/proposals", json=payload)
+    response = await client.post("/api/v1/proposals", json=payload, headers=headers)
     assert response.status_code == 422
 
 
 async def test_api_duplicate_proposal_replay(client: httpx.AsyncClient) -> None:
     """Duplicate submissions return the original proposal without inserting."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     payload = _proposal_api_payload(mandate_id)
-    first = await client.post("/api/v1/proposals", json=payload)
-    second = await client.post("/api/v1/proposals", json=payload)
+    first = await client.post("/api/v1/proposals", json=payload, headers=headers)
+    second = await client.post("/api/v1/proposals", json=payload, headers=headers)
     assert first.status_code == 201
     assert second.status_code == 200
     assert first.json()["proposal_id"] == second.json()["proposal_id"]
 
-    listed = await client.get(f"/api/v1/proposals?mandate_id={mandate_id}")
+    listed = await client.get(f"/api/v1/proposals?mandate_id={mandate_id}", headers=headers)
     assert listed.status_code == 200
     assert len(listed.json()) == 1
 
 
 async def test_api_idempotency_conflict(client: httpx.AsyncClient) -> None:
     """The same idempotency key cannot cover two different baskets."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     first = _proposal_api_payload(mandate_id, product_id="sku-1")
     second = _proposal_api_payload(mandate_id, product_id="sku-2")
-    assert (await client.post("/api/v1/proposals", json=first)).status_code == 201
-    conflict = await client.post("/api/v1/proposals", json=second)
+    assert (await client.post("/api/v1/proposals", json=first, headers=headers)).status_code == 201
+    conflict = await client.post("/api/v1/proposals", json=second, headers=headers)
     assert conflict.status_code == 409
 
 
 async def test_api_get_and_list_proposals(client: httpx.AsyncClient) -> None:
     """GET by ID and list endpoints return persisted proposals."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     created = await client.post(
-        "/api/v1/proposals", json=_proposal_api_payload(mandate_id)
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers
     )
     proposal_id = created.json()["proposal_id"]
 
-    fetched = await client.get(f"/api/v1/proposals/{proposal_id}")
+    fetched = await client.get(f"/api/v1/proposals/{proposal_id}", headers=headers)
     assert fetched.status_code == 200
     assert fetched.json()["product_id"] == "sku-100"
 
-    missing = await client.get("/api/v1/proposals/prp_missing")
+    missing = await client.get("/api/v1/proposals/prp_missing", headers=headers)
     assert missing.status_code == 404
 
-    listed = await client.get("/api/v1/proposals?limit=10")
+    listed = await client.get("/api/v1/proposals?limit=10", headers=headers)
     assert listed.status_code == 200
     assert len(listed.json()) == 1
 
 
 async def test_api_tampered_proposal_get(client: httpx.AsyncClient) -> None:
     """GET rejects proposals whose stored terms no longer match the hash."""
-    mandate_id = await _create_mandate(client)
+    mandate_id, headers = await _create_mandate(client)
     created = await client.post(
-        "/api/v1/proposals", json=_proposal_api_payload(mandate_id)
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers
     )
     proposal_id = created.json()["proposal_id"]
 
@@ -171,20 +190,107 @@ async def test_api_tampered_proposal_get(client: httpx.AsyncClient) -> None:
         )
         await db.commit()
 
-    response = await client.get(f"/api/v1/proposals/{proposal_id}")
+    response = await client.get(f"/api/v1/proposals/{proposal_id}", headers=headers)
     assert response.status_code == 422
 
 
 async def test_api_mandate_endpoints_still_work(client: httpx.AsyncClient) -> None:
     """Proposal routes do not break existing mandate API behavior."""
-    mandate_id = await _create_mandate(client)
-    await client.post("/api/v1/proposals", json=_proposal_api_payload(mandate_id))
-    confirm = await client.post(f"/api/v1/mandates/{mandate_id}/confirm")
+    mandate_id, headers = await _create_mandate(client)
+    await client.post("/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers)
+    confirm = await client.post(f"/api/v1/mandates/{mandate_id}/confirm", headers=headers)
     assert confirm.status_code == 200
-    sign = await client.post(f"/api/v1/mandates/{mandate_id}/sign")
+    sign = await client.post(f"/api/v1/mandates/{mandate_id}/sign", headers=headers)
     assert sign.status_code == 200
-    activate = await client.post(f"/api/v1/mandates/{mandate_id}/activate")
+    activate = await client.post(f"/api/v1/mandates/{mandate_id}/activate", headers=headers)
     assert activate.status_code == 200
-    verify = await client.get(f"/api/v1/mandates/{mandate_id}/verify")
+    verify = await client.get(f"/api/v1/mandates/{mandate_id}/verify", headers=headers)
     assert verify.status_code == 200
     assert verify.json()["valid"] is True
+
+
+async def test_proposal_api_requires_auth_for_create_list_retrieve_and_evaluate(
+    client: httpx.AsyncClient,
+) -> None:
+    """Proposal operations reject anonymous requests before changing state."""
+    mandate_id, headers = await _create_mandate(client)
+    created = await client.post(
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers
+    )
+    proposal_id = created.json()["proposal_id"]
+    assert (await client.post(
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id, product_id="sku-2")
+    )).status_code == 401
+    assert (await client.get("/api/v1/proposals")).status_code == 401
+    assert (await client.get(f"/api/v1/proposals/{proposal_id}")).status_code == 401
+    assert (await client.post(f"/api/v1/proposals/{proposal_id}/evaluate")).status_code == 401
+    listed = await client.get("/api/v1/proposals", headers=headers)
+    assert [item["proposal_id"] for item in listed.json()] == [proposal_id]
+
+
+async def test_proposal_api_enforces_owner_scope_and_mandate_association(
+    client: httpx.AsyncClient,
+) -> None:
+    """A user cannot associate, read, list, or evaluate proposals for another owner."""
+    mandate_a, headers_a = await _create_mandate(client)
+    mandate_b, headers_b = await _create_mandate(client)
+    foreign_create = await client.post(
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_b), headers=headers_a
+    )
+    assert foreign_create.status_code == 404
+    nonexistent_create = await client.post(
+        "/api/v1/proposals",
+        json=_proposal_api_payload("man_nonexistent"),
+        headers=headers_a,
+    )
+    assert foreign_create.status_code == nonexistent_create.status_code
+    assert foreign_create.json()["detail"] == nonexistent_create.json()["detail"]
+    async with aiosqlite.connect(get_db_path()) as db:
+        assert (await (await db.execute(
+            "SELECT COUNT(*) FROM proposals"
+        )).fetchone())[0] == 0
+
+    created = await client.post(
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_a), headers=headers_a
+    )
+    proposal_id = created.json()["proposal_id"]
+    foreign_read = await client.get(
+        f"/api/v1/proposals/{proposal_id}", headers=headers_b
+    )
+    missing_read = await client.get(
+        "/api/v1/proposals/prp_nonexistent", headers=headers_b
+    )
+    assert foreign_read.status_code == missing_read.status_code == 404
+    assert foreign_read.json()["detail"] == missing_read.json()["detail"]
+
+    foreign_evaluate = await client.post(
+        f"/api/v1/proposals/{proposal_id}/evaluate", headers=headers_b
+    )
+    missing_evaluate = await client.post(
+        "/api/v1/proposals/prp_nonexistent/evaluate", headers=headers_b
+    )
+    assert foreign_evaluate.status_code == missing_evaluate.status_code == 404
+    assert foreign_evaluate.json()["detail"] == missing_evaluate.json()["detail"]
+
+    foreign_filter = await client.get(
+        f"/api/v1/proposals?mandate_id={mandate_a}", headers=headers_b
+    )
+    missing_filter = await client.get(
+        "/api/v1/proposals?mandate_id=man_nonexistent", headers=headers_b
+    )
+    assert foreign_filter.status_code == missing_filter.status_code == 404
+    assert foreign_filter.json()["detail"] == missing_filter.json()["detail"]
+    foreign_list = await client.get("/api/v1/proposals", headers=headers_b)
+    assert foreign_list.status_code == 200
+    assert foreign_list.json() == []
+
+    async with aiosqlite.connect(get_db_path()) as db:
+        row = await (await db.execute(
+            "SELECT status FROM proposals WHERE proposal_id = ?", (proposal_id,)
+        )).fetchone()
+        assert row[0] == "SUBMITTED"
+        assert (await (await db.execute("SELECT COUNT(*) FROM paypal_orders")).fetchone())[0] == 0
+
+    owner_read = await client.get(f"/api/v1/proposals/{proposal_id}", headers=headers_a)
+    assert owner_read.status_code == 200
+    assert owner_read.json()["status"] == "SUBMITTED"

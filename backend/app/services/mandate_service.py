@@ -17,6 +17,7 @@ from app.db.database import (
     get_connection,
     get_mandate_from_db,
     list_mandates_from_db,
+    list_mandates_for_owner_from_db,
     save_mandate_to_db,
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
@@ -332,6 +333,15 @@ async def verify_mandate(
 async def list_mandates(limit: int = 50) -> list[Mandate]:
     """List recent mandates, applying expiration where the validity window has closed."""
     mandates = await list_mandates_from_db(limit=limit)
+    expired: list[Mandate] = []
+    for mandate in mandates:
+        expired.append(await _expire_if_needed(mandate))
+    return expired
+
+
+async def list_mandates_for_owner(owner_user_id: str, limit: int = 50) -> list[Mandate]:
+    """List only mandates permanently owned by the authenticated principal."""
+    mandates = await list_mandates_for_owner_from_db(owner_user_id, limit=limit)
     expired: list[Mandate] = []
     for mandate in mandates:
         expired.append(await _expire_if_needed(mandate))

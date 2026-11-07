@@ -12,7 +12,7 @@ from app.schemas.session import UserSession
 from app.schemas.policy import PolicyDecision
 from app.schemas.proposal import Proposal, ProposalCreate
 from app.services.mandate_service import MandateNotFoundError
-from app.services.mandate_service import get_mandate
+from app.services.mandate_service import get_mandate_from_db
 from app.services.proposal_service import (
     CurrencyMismatchError,
     DuplicateProposalConflictError,
@@ -20,12 +20,29 @@ from app.services.proposal_service import (
     ProposalTamperedError,
     create_proposal,
     evaluate_proposal_service,
-    get_proposal,
+    get_proposal_for_owner,
     list_proposals,
 )
 from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 router = APIRouter(prefix="/proposals", tags=["Proposals"])
+
+
+async def _require_owned_mandate(mandate_id: str, user_id: str) -> None:
+    """Reject missing and foreign mandates identically without mutating them."""
+    mandate = await get_mandate_from_db(mandate_id)
+    if mandate is None or mandate.owner_user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Mandate not found.")
+
+
+async def _owned_proposal_or_404(proposal_id: str, user_id: str) -> Proposal:
+    """Return a proposal only when its immutable mandate owner matches the session."""
+    try:
+        return await get_proposal_for_owner(proposal_id, user_id)
+    except ProposalNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Proposal not found.") from None
 
 
 def _http_for_proposal_errors(exc: Exception) -> HTTPException:
@@ -51,13 +68,17 @@ def _http_for_proposal_errors(exc: Exception) -> HTTPException:
 
 
 @router.post("", response_model=Proposal, status_code=status.HTTP_201_CREATED)
-async def create_proposal_endpoint(payload: ProposalCreate) -> Proposal | JSONResponse:
+async def create_proposal_endpoint(
+    payload: ProposalCreate,
+    session: UserSession = Depends(get_current_session),
+) -> Proposal | JSONResponse:
     """Submit a purchase proposal associated with exactly one mandate.
 
     Server recalculates subtotal and total. Duplicate fingerprints or matching
     idempotency keys return the original proposal without modification.
     """
     try:
+        await _require_owned_mandate(payload.mandate_id, session.user_id)
         proposal, created = await create_proposal(payload)
     except (
         MandateNotFoundError,
@@ -78,19 +99,27 @@ async def create_proposal_endpoint(payload: ProposalCreate) -> Proposal | JSONRe
 async def list_proposals_endpoint(
     limit: int = Query(default=50, ge=1, le=100),
     mandate_id: str | None = Query(default=None),
+    session: UserSession = Depends(get_current_session),
 ) -> list[Proposal]:
     """List recent proposals, optionally filtered by mandate ID."""
     try:
-        return await list_proposals(limit=limit, mandate_id=mandate_id)
+        if mandate_id is not None:
+            await _require_owned_mandate(mandate_id, session.user_id)
+        return await list_proposals(
+            limit=limit, mandate_id=mandate_id, owner_user_id=session.user_id
+        )
     except (MandateNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc
 
 
 @router.get("/{proposal_id}", response_model=Proposal)
-async def get_proposal_endpoint(proposal_id: str) -> Proposal:
+async def get_proposal_endpoint(
+    proposal_id: str,
+    session: UserSession = Depends(get_current_session),
+) -> Proposal:
     """Retrieve a stored proposal after integrity verification."""
     try:
-        return await get_proposal(proposal_id)
+        return await _owned_proposal_or_404(proposal_id, session.user_id)
     except (ProposalNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc
 
@@ -101,11 +130,7 @@ async def evaluate_proposal_endpoint(
 ) -> PolicyDecision:
     """Evaluate only a proposal owned by the authenticated session principal."""
     try:
-        proposal = await get_proposal(proposal_id)
-        mandate = await get_mandate(proposal.mandate_id)
-        if not mandate.owner_user_id or mandate.owner_user_id != session.user_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail="The authenticated principal does not own this proposal.")
+        await _owned_proposal_or_404(proposal_id, session.user_id)
         return await evaluate_proposal_service(proposal_id)
     except IntentAuditorUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -17,6 +17,7 @@ from app.db.database import (
     get_cumulative_mandate_spent,
     get_proposal_by_fingerprint,
     get_proposal_by_idempotency_key,
+    get_proposal_for_owner_from_db,
     get_proposal_from_db,
     get_today_reserved_spend,
     insert_proposal_to_db,
@@ -174,14 +175,29 @@ async def get_proposal(
     return proposal
 
 
+async def get_proposal_for_owner(proposal_id: str, owner_user_id: str) -> Proposal:
+    """Retrieve and verify a proposal without revealing foreign proposal IDs."""
+    try:
+        proposal = await get_proposal_for_owner_from_db(proposal_id, owner_user_id)
+    except StoredProposalTamperedError as exc:
+        raise ProposalTamperedError(str(exc)) from exc
+    if proposal is None:
+        raise ProposalNotFoundError("Proposal not found.")
+    return proposal
+
+
 async def list_proposals(
-    limit: int = 50, mandate_id: str | None = None
+    limit: int = 50,
+    mandate_id: str | None = None,
+    owner_user_id: str | None = None,
 ) -> list[Proposal]:
     """List recent proposals, optionally scoped to one mandate."""
-    if mandate_id is not None:
+    if mandate_id is not None and owner_user_id is None:
         await get_mandate(mandate_id)
     try:
-        return await list_proposals_from_db(limit=limit, mandate_id=mandate_id)
+        return await list_proposals_from_db(
+            limit=limit, mandate_id=mandate_id, owner_user_id=owner_user_id
+        )
     except StoredProposalTamperedError as exc:
         raise ProposalTamperedError(str(exc)) from exc
 
