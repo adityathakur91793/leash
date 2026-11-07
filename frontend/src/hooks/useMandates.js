@@ -377,6 +377,31 @@ export function useMandates(token, onSessionExpired) {
     setError(null);
   }, []);
 
+  const refreshDetail = useCallback(async (mandateId = selectedIdRef.current) => {
+    const capturedToken = tokenRef.current;
+    if (!capturedToken || !mandateId || !mountedRef.current) return null;
+    const generation = sessionGenerationRef.current;
+    const requestId = ++detailRequestRef.current;
+    setDetailLoading(true);
+    try {
+      const result = await getMandate(capturedToken, mandateId);
+      if (!isCurrentSession(capturedToken, generation)
+        || requestId !== detailRequestRef.current
+        || selectedIdRef.current !== mandateId) return null;
+      setSelectedMandate(result);
+      setMandates((items) => upsertMandate(items, result));
+      loadedTokenRef.current = capturedToken;
+      return result;
+    } catch (failure) {
+      reportError(failure, capturedToken, generation);
+      return null;
+    } finally {
+      if (isCurrentSession(capturedToken, generation)
+        && requestId === detailRequestRef.current
+        && selectedIdRef.current === mandateId) setDetailLoading(false);
+    }
+  }, [isCurrentSession, reportError]);
+
   useEffect(() => {
     const capturedToken = tokenRef.current;
     const mandateId = selectedMandateId;
@@ -687,6 +712,7 @@ export function useMandates(token, onSessionExpired) {
     error,
     refresh,
     selectMandate,
+    refreshDetail,
     create,
     confirm,
     sign,

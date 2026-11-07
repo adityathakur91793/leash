@@ -1,13 +1,18 @@
-import { CheckCircle, Loader, LogOut, RefreshCw, Shield, XCircle } from 'lucide-react';
+import { useState } from 'react';
+import { CheckCircle, Loader, LogOut, RefreshCw, Shield, ShoppingBag, SlidersHorizontal, XCircle } from 'lucide-react';
 import { useBackendStatus } from './hooks/useBackendStatus';
 import { useSession } from './hooks/useSession';
 import { StatusCard } from './components/StatusCard';
 import { ShoppingAgent } from './components/ShoppingAgent';
+import { MandateManager } from './components/MandateManager';
+import { useMandates } from './hooks/useMandates';
 import './App.css';
 
 function App() {
   const { health, status, loading, error } = useBackendStatus();
   const session = useSession();
+  const [activeView, setActiveView] = useState('mandates');
+  const mandateState = useMandates(session.status === 'active' ? session.token : null, session.markExpired);
 
   const sessionLabel = {
     loading: 'Connecting',
@@ -61,28 +66,32 @@ function App() {
             )}
           </div>
         </section>
-        <section className="status-section">
-          <h2>System Status</h2>
-          <div className="status-grid">
-            <StatusCard
-              title="Backend Health"
-              loading={loading}
-              error={error}
-              details={health}
-            />
-            <StatusCard
-              title="API Status"
-              loading={loading}
-              error={error}
-              details={status}
-            />
-          </div>
-        </section>
+        <nav className="primary-nav" aria-label="Main navigation">
+          <button type="button" aria-current={activeView === 'mandates' ? 'page' : undefined} className={activeView === 'mandates' ? 'nav-active' : ''} onClick={() => setActiveView('mandates')}><SlidersHorizontal size={17} /> Mandates</button>
+          <button type="button" aria-current={activeView === 'shopping' ? 'page' : undefined} className={activeView === 'shopping' ? 'nav-active' : ''} onClick={() => setActiveView('shopping')}><ShoppingBag size={17} /> Shopping agent</button>
+          <button type="button" aria-current={activeView === 'status' ? 'page' : undefined} className={activeView === 'status' ? 'nav-active' : ''} onClick={() => setActiveView('status')}><Shield size={17} /> System status</button>
+        </nav>
         {session.status === 'loading' ? (
           <div className="session-loading" role="status">Checking your session…</div>
-        ) : (
+        ) : activeView === 'mandates' ? (
+          session.status === 'active' ? <MandateManager mandates={mandateState} /> : (
+            <section className="mandate-card session-required">
+              <Shield size={24} />
+              <h2>Start a session to manage mandates</h2>
+              <p>Mandates are scoped to your authenticated LEASH session.</p>
+            </section>
+          )
+        ) : activeView === 'shopping' ? (
           <ShoppingAgent token={session.status === 'active' ? session.token : null}
             onSessionExpired={session.markExpired} />
+        ) : (
+          <section className="status-section">
+            <h2>System status</h2>
+            <div className="status-grid">
+              <StatusCard title="Backend Health" loading={loading} error={error} details={health} />
+              <StatusCard title="API Status" loading={loading} error={error} details={status} />
+            </div>
+          </section>
         )}
       </main>
 

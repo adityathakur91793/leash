@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import App from '../App';
 
@@ -23,6 +23,7 @@ describe('App session integration', () => {
 
     render(<App />);
     expect(await screen.findByRole('heading', { name: 'Session ended' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /shopping agent/i }));
     expect(screen.getByRole('button', { name: 'Ask LEASH' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Start new session' })).toBeEnabled();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
