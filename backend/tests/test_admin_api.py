@@ -5,7 +5,7 @@ import pytest
 
 from app.core.config import settings
 
-ADMIN_KEY = "leash-test-admin-key-32-bytes-minimum-secret!!"
+ADMIN_KEY = settings.ADMIN_API_KEY
 
 
 @pytest.mark.asyncio
