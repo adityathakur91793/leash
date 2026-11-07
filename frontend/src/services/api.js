@@ -8,11 +8,12 @@ const SAFE_MESSAGES = {
 };
 
 export class ApiError extends Error {
-  constructor(message, { status = null, code = 'request' } = {}) {
+  constructor(message, { status = null, code = 'request', details = null } = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -33,8 +34,28 @@ async function readResponse(response) {
   }
 }
 
+function safeValidationDetails(data) {
+  const detail = data?.detail;
+  if (!Array.isArray(detail)) return null;
+
+  const fields = detail.slice(0, 50).map((item) => {
+    if (!item || typeof item !== 'object') return null;
+    const loc = Array.isArray(item.loc) ? item.loc.slice(0, 8).filter((part) => (
+      typeof part === 'number'
+      || (typeof part === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(part))
+    )) : [];
+    if (!loc.length || typeof item.msg !== 'string') return null;
+    const msg = item.msg.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 500);
+    const type = typeof item.type === 'string'
+      && /^[A-Za-z0-9_.-]{1,100}$/.test(item.type) ? item.type
+      : null;
+    return { loc, msg, type };
+  }).filter(Boolean);
+  return fields.length ? fields : null;
+}
+
 export async function request(path, options = {}) {
-  const { token, headers: suppliedHeaders, ...fetchOptions } = options;
+  const { token, headers: suppliedHeaders, expectedStatus, ...fetchOptions } = options;
   const headers = new Headers(suppliedHeaders || {});
   if (token) headers.set('Authorization', `Bearer ${token}`);
 
@@ -62,6 +83,13 @@ export async function request(path, options = {}) {
     throw new ApiError(messageForStatus(response.status), {
       status: response.status,
       code,
+      details: response.status === 422 ? safeValidationDetails(data) : null,
+    });
+  }
+  if (expectedStatus !== undefined && response.status !== expectedStatus) {
+    throw new ApiError('The service returned an unexpected success response.', {
+      status: response.status,
+      code: 'unexpected-success-status',
     });
   }
   return data;

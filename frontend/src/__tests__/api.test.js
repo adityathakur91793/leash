@@ -56,6 +56,38 @@ describe('shared API client', () => {
     });
   });
 
+  it('exposes only bounded structured 422 field details', async () => {
+    const longMessage = 'x'.repeat(700);
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(response(422, JSON.stringify({ detail: [
+        {
+          loc: ['body', 'expires_at', '<script>'],
+          msg: longMessage,
+          type: 'value_error',
+          input: 'must not be copied',
+          ctx: { secret: 'must not be copied' },
+          unexpected: 'must not be copied',
+        },
+      ] })))
+      .mockResolvedValueOnce(response(422, JSON.stringify({ detail: 'internal detail' })))
+      .mockResolvedValueOnce(response(422, '{malformed'))
+      .mockResolvedValueOnce(response(422, JSON.stringify({ detail: [{ loc: ['body', {}], msg: 3 }] }))));
+
+    let structuredError;
+    try { await request('/structured'); } catch (error) { structuredError = error; }
+    expect(structuredError.details).toEqual([{
+      loc: ['body', 'expires_at'], msg: 'x'.repeat(500), type: 'value_error',
+    }]);
+    expect(JSON.stringify(structuredError.details)).not.toContain('must not be copied');
+
+    for (const path of ['/string', '/malformed', '/wrong-shape']) {
+      let error;
+      try { await request(path); } catch (failure) { error = failure; }
+      expect(error.details).toBeNull();
+      expect(error.message).toBe('Some submitted information needs attention. Review it and try again.');
+    }
+  });
+
   it('distinguishes authentication from authorization failures', async () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(response(401, '{"detail":"expired"}'))
