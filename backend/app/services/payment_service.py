@@ -400,6 +400,11 @@ async def capture_payment_order(
             f"Order '{order_id}' cannot be captured (status: {order_record.status.value})."
         )
 
+    if order_record.status == PayPalOrderStatus.RECONCILIATION_REQUIRED:
+        raise PayPalCaptureError(
+            "Capture outcome is uncertain; order requires explicit reconciliation."
+        )
+
     proposal = await get_proposal_from_db(order_record.proposal_id)
     if proposal is None:
         raise ProposalNotFoundError(f"Proposal '{order_record.proposal_id}' not found.")
@@ -489,6 +494,57 @@ async def capture_payment_order(
         try:
             if await is_kill_switch_active(db=conn):
                 raise RuntimeError("Emergency kill switch is active. Payment execution halted.")
+            current_order = await get_paypal_order_from_db(order_id, db=conn)
+            if current_order is None:
+                raise PaymentOrderNotFoundError(
+                    f"PayPal order '{order_id}' not found during capture authorization."
+                )
+            if current_order.owner_user_id != principal_id:
+                raise MandateOwnershipError(
+                    f"Principal '{principal_id}' does not own payment order '{order_id}'."
+                )
+            if current_order.status == PayPalOrderStatus.COMPLETED:
+                if not current_order.capture_id:
+                    raise PayPalCaptureError(
+                        "Completed PayPal order has no verified capture ID."
+                    )
+                return PaymentCaptureResponse(
+                    order_id=current_order.order_id,
+                    proposal_id=current_order.proposal_id,
+                    mandate_id=current_order.mandate_id,
+                    capture_id=current_order.capture_id,
+                    status=PayPalOrderStatus.COMPLETED,
+                    currency=current_order.currency,
+                    total_amount=current_order.total_amount,
+                    captured_at=current_order.captured_at or current_order.updated_at,
+                    receipt={
+                        "order_id": current_order.order_id,
+                        "capture_id": current_order.capture_id,
+                        "status": "COMPLETED",
+                        "amount": str(current_order.total_amount),
+                        "currency": current_order.currency,
+                    },
+                )
+            if current_order.status in (
+                PayPalOrderStatus.FAILED,
+                PayPalOrderStatus.CANCELLED,
+            ):
+                raise ValueError(
+                    f"Order '{order_id}' cannot be captured "
+                    f"(status: {current_order.status.value})."
+                )
+            if current_order.status == PayPalOrderStatus.RECONCILIATION_REQUIRED:
+                raise PayPalCaptureError(
+                    "Capture outcome is uncertain; order requires explicit reconciliation."
+                )
+            if current_order.status not in (
+                PayPalOrderStatus.CREATED,
+                PayPalOrderStatus.APPROVED,
+            ):
+                raise PayPalCaptureError(
+                    f"Order '{order_id}' is not in a capturable state."
+                )
+            order_record = current_order
             current_proposal = await get_proposal_from_db(proposal.proposal_id, db=conn)
             current_mandate = await get_mandate_from_db(mandate.mandate_id, db=conn)
             if current_proposal is None or current_mandate is None:
