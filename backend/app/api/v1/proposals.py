@@ -10,6 +10,7 @@ from app.api.dependencies import get_current_session
 from app.schemas.session import UserSession
 
 from app.schemas.policy import PolicyDecision
+from app.schemas.intent_audit import ProposalIntentAssessmentResponse
 from app.schemas.proposal import Proposal, ProposalCreate
 from app.services.mandate_service import MandateNotFoundError
 from app.services.mandate_service import get_mandate_from_db
@@ -24,6 +25,7 @@ from app.services.proposal_service import (
     list_proposals,
 )
 from app.services.intent_auditor_client import IntentAuditorUnavailable
+from app.services.intent_audit_service import AssessmentRetrievalError, get_owner_assessment
 
 router = APIRouter(prefix="/proposals", tags=["Proposals"])
 
@@ -122,6 +124,27 @@ async def get_proposal_endpoint(
         return await _owned_proposal_or_404(proposal_id, session.user_id)
     except (ProposalNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc
+
+
+@router.get(
+    "/{proposal_id}/auditor-assessment",
+    response_model=ProposalIntentAssessmentResponse,
+)
+async def get_proposal_auditor_assessment_endpoint(
+    proposal_id: str,
+    session: UserSession = Depends(get_current_session),
+) -> ProposalIntentAssessmentResponse:
+    """Read the latest persisted auditor assessment for the proposal owner."""
+    try:
+        await _owned_proposal_or_404(proposal_id, session.user_id)
+        return await get_owner_assessment(proposal_id, session.user_id)
+    except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
+        raise _http_for_proposal_errors(exc) from exc
+    except AssessmentRetrievalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Assessment data is unavailable.",
+        ) from exc
 
 
 @router.post("/{proposal_id}/evaluate", response_model=PolicyDecision)

@@ -1,5 +1,6 @@
 """Strict input, output, and persistence schemas for the Intent Auditor."""
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
@@ -120,4 +121,29 @@ class IntentAssessmentRecord(StrictAuditModel):
     model_identifier: str
     failure_code: str | None = None
     created_at: str
+
+
+class PublicIntentAssessment(StrictAuditModel):
+    """Minimized assessment view safe to return to the proposal owner."""
+
+    status: IntentAssessmentStatus
+    risk_level: IntentRiskLevel
+    finding_codes: list[IntentFindingCode]
+    affected_fields: list[IntentAffectedField]
+    created_at: datetime
+    is_current: bool
+
+    @field_validator("created_at", mode="after")
+    @classmethod
+    def validate_created_at_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("created_at must be timezone-aware.")
+        return value.astimezone(timezone.utc)
+
+
+class ProposalIntentAssessmentResponse(StrictAuditModel):
+    """Owner-scoped retrieval response; assessment is null when none is stored."""
+
+    proposal_id: str
+    assessment: PublicIntentAssessment | None
 

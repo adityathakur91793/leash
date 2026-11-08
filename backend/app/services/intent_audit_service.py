@@ -10,11 +10,13 @@ from decimal import Decimal
 from enum import Enum
 
 import aiosqlite
+from pydantic import ValidationError
 
 from app.core.config import settings
 from app.db.database import (
     get_connection,
     get_cumulative_mandate_spent,
+    get_mandate_from_db,
     get_proposal_by_fingerprint,
     get_proposal_by_idempotency_key,
     get_today_reserved_spend,
@@ -22,6 +24,7 @@ from app.db.database import (
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.intent_audit import (
+    IntentAssessmentRecord,
     IntentAssessmentStatus,
     IntentAuditorInput,
     IntentAuditorPolicyRule,
@@ -29,6 +32,8 @@ from app.schemas.intent_audit import (
     IntentMandateSummary,
     IntentProposalSummary,
     IntentRiskLevel,
+    ProposalIntentAssessmentResponse,
+    PublicIntentAssessment,
 )
 from app.schemas.mandate import Mandate
 from app.schemas.policy import DecisionOutcome, EvaluationContext, OracleResult, PolicyDecision
@@ -43,7 +48,7 @@ from app.services.intent_auditor_client import (
 from app.services.kill_switch_service import enforce_kill_switch_guard
 from app.services.mandate_service import get_mandate
 from app.services.policy_engine import evaluate_policy
-from app.services.proposal_service import get_proposal
+from app.services.proposal_service import ProposalNotFoundError, get_proposal
 
 POLICY_VERSION = "P01-P12-v1"
 _EXCLUDED_EVIDENCE_KEY_PARTS = (
@@ -63,6 +68,10 @@ class DeterministicBlockDetected(Exception):
 
     def __init__(self, decision: PolicyDecision) -> None:
         self.decision = decision
+
+
+class AssessmentRetrievalError(Exception):
+    """Persisted assessment or current-state data could not be read safely."""
 
 
 def _sha(value: str) -> str:
@@ -384,3 +393,123 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
         return await check(db)
     async with get_connection() as conn:
         return await check(conn)
+
+
+def _assessment_record_from_row(row: aiosqlite.Row) -> IntentAssessmentRecord:
+    """Validate a persisted row against the internal assessment schema."""
+    try:
+        return IntentAssessmentRecord.model_validate({
+            "assessment_id": row["assessment_id"],
+            "proposal_id": row["proposal_id"],
+            "mandate_id": row["mandate_id"],
+            "status": row["status"],
+            "risk_level": row["risk_level"],
+            "finding_codes": json.loads(row["finding_codes_json"]),
+            "affected_fields": json.loads(row["affected_fields_json"]),
+            "proposal_content_hash": row["proposal_content_hash"],
+            "mandate_permissions_hash": row["mandate_permissions_hash"],
+            "policy_snapshot_hash": row["policy_snapshot_hash"],
+            "policy_version": row["policy_version"],
+            "schema_version": row["schema_version"],
+            "prompt_version": row["prompt_version"],
+            "model_identifier": row["model_identifier"],
+            "failure_code": row["failure_code"],
+            "created_at": row["created_at"],
+        })
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError) as exc:
+        raise AssessmentRetrievalError("Persisted assessment data is invalid.") from exc
+
+
+async def _assessment_is_current(
+    record: IntentAssessmentRecord,
+    proposal: Proposal,
+    mandate: Mandate,
+    *,
+    db: aiosqlite.Connection,
+    now: datetime,
+) -> bool:
+    """Compare all persisted bindings with current, transaction-consistent state."""
+    if record.status != IntentAssessmentStatus.VALID:
+        return False
+    if record.proposal_id != proposal.proposal_id or record.mandate_id != mandate.mandate_id:
+        return False
+    if record.policy_version != POLICY_VERSION:
+        return False
+    if record.schema_version != SCHEMA_VERSION:
+        return False
+    if record.prompt_version != PROMPT_VERSION:
+        return False
+    if record.model_identifier != settings.GEMINI_MODEL:
+        return False
+    if record.proposal_content_hash != proposal.content_hash:
+        return False
+    if record.mandate_permissions_hash != mandate_permissions_hash(mandate):
+        return False
+
+    decision = await current_policy_decision(proposal, mandate, db=db, now=now)
+    return (
+        decision.decision != DecisionOutcome.BLOCK
+        and record.policy_snapshot_hash == policy_snapshot_hash(decision)
+    )
+
+
+async def get_owner_assessment(
+    proposal_id: str, owner_user_id: str
+) -> ProposalIntentAssessmentResponse:
+    """Read an owner's latest assessment and derive freshness without side effects."""
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        # The explicit read transaction gives proposal, mandate, and assessment one snapshot.
+        await db.execute("BEGIN")
+        try:
+            proposal = await get_proposal(proposal_id, db=db)
+            mandate = await get_mandate_from_db(proposal.mandate_id, db=db)
+            if mandate is None or mandate.owner_user_id != owner_user_id:
+                raise ProposalNotFoundError("Proposal not found.")
+
+            cursor = await db.execute(
+                "SELECT assessment_id, proposal_id, mandate_id, status, risk_level, "
+                "finding_codes_json, affected_fields_json, proposal_content_hash, "
+                "mandate_permissions_hash, policy_snapshot_hash, policy_version, "
+                "schema_version, prompt_version, model_identifier, failure_code, created_at "
+                "FROM intent_assessments WHERE proposal_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (proposal_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return ProposalIntentAssessmentResponse(
+                    proposal_id=proposal_id, assessment=None
+                )
+
+            record = _assessment_record_from_row(row)
+            if (record.status == IntentAssessmentStatus.FAILED
+                    and record.risk_level != IntentRiskLevel.UNCERTAIN):
+                raise AssessmentRetrievalError("Persisted failed assessment data is invalid.")
+            try:
+                created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                current = await _assessment_is_current(
+                    record, proposal, mandate, db=db, now=datetime.now(timezone.utc)
+                )
+                public = PublicIntentAssessment(
+                    status=record.status,
+                    risk_level=record.risk_level,
+                    finding_codes=record.finding_codes,
+                    affected_fields=record.affected_fields,
+                    created_at=created_at,
+                    is_current=current,
+                )
+            except ValidationError as exc:
+                raise AssessmentRetrievalError(
+                    "Persisted assessment data is invalid."
+                ) from exc
+            except (AttributeError, TypeError, ValueError, aiosqlite.Error) as exc:
+                raise AssessmentRetrievalError(
+                    "Assessment freshness could not be determined safely."
+                ) from exc
+            return ProposalIntentAssessmentResponse(
+                proposal_id=proposal_id, assessment=public
+            )
+        except Exception:
+            await db.rollback()
+            raise
