@@ -7,6 +7,7 @@ import { ShoppingAgent } from './components/ShoppingAgent';
 import { MandateManager } from './components/MandateManager';
 import { useMandates } from './hooks/useMandates';
 import { useProposals } from './hooks/useProposals';
+import { useIntentAssessment } from './hooks/useIntentAssessment';
 import { ProposalInbox } from './components/ProposalInbox';
 import './App.css';
 
@@ -16,6 +17,14 @@ function App() {
   const [activeView, setActiveView] = useState('mandates');
   const mandateState = useMandates(session.status === 'active' ? session.token : null, session.markExpired);
   const proposalState = useProposals(session.status === 'active' ? session.token : null, session.markExpired);
+  const intentAssessmentState = useIntentAssessment(
+    session.status === 'active' ? session.token : null,
+    session.markExpired,
+    proposalState.selectedId,
+    proposalState.evaluationRevision,
+    session.status,
+  );
+  const proposalInboxState = { ...proposalState, intentAssessment: intentAssessmentState };
 
   const sessionLabel = {
     loading: 'Connecting',
@@ -86,7 +95,7 @@ function App() {
             </section>
           )
         ) : activeView === 'proposals' ? (
-          session.status === 'active' ? <ProposalInbox proposals={proposalState} /> : (
+          session.status === 'active' ? <ProposalInbox proposals={proposalInboxState} /> : (
             <section className="mandate-card session-required"><Shield size={24} /><h2>Start a session to review proposals</h2><p>Proposals are scoped to your authenticated LEASH session.</p></section>
           )
         ) : activeView === 'shopping' ? (

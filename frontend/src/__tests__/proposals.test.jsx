@@ -48,7 +48,7 @@ describe('proposal inbox', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Unsafe/ }));
     expect(await screen.findByText('<b>Unsafe</b>')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Unsafe' })).not.toBeInTheDocument();
-    expect(screen.getByText(/does not expose persisted auditor findings/i)).toBeInTheDocument();
+    expect(screen.getByText('The assessment data is not displayed in this screen yet.')).toBeInTheDocument();
     expect(screen.queryByText('hidden')).not.toBeInTheDocument();
   });
 

@@ -17,6 +17,7 @@ export function useProposals(token, onSessionExpired) {
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
+  const [evaluationRevision, setEvaluationRevision] = useState(0);
   const [error, setError] = useState(null);
   const generation = useRef(0);
   const listId = useRef(0);
@@ -118,6 +119,7 @@ export function useProposals(token, onSessionExpired) {
           || req !== detailId.current || selectedIdRef.current !== id) return null;
       const result = validatePolicyDecision(response, id, detail.mandate_id);
       setDecision(result);
+      setEvaluationRevision((revision) => revision + 1);
       try {
         const [detailResponse, listResult] = await Promise.all([
           getProposal(captured, id), fetchList('Evaluation completed, but proposal status could not be refreshed'),
@@ -151,5 +153,8 @@ export function useProposals(token, onSessionExpired) {
       }
     }
   }, [detail, fetchList, handle, selectedId]);
-  return { items, selectedId, detail, decision, loading, detailLoading, evaluating, error, refresh, select, evaluate };
+  return {
+    items, selectedId, detail, decision, loading, detailLoading, evaluating, error,
+    evaluationRevision, refresh, select, evaluate,
+  };
 }
