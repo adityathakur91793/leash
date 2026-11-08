@@ -23,6 +23,10 @@ from app.db.database import (
     is_kill_switch_active,
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
+from app.schemas.authorization import (
+    AuthorizationSnapshotResponse,
+    public_policy_decision,
+)
 from app.schemas.intent_audit import (
     IntentAffectedField,
     IntentAssessmentRecord,
@@ -579,4 +583,78 @@ async def get_owner_assessment(
             )
         except Exception:
             await db.rollback()
+            raise
+
+
+async def get_owner_authorization_snapshot(
+    proposal_id: str, owner_user_id: str
+) -> AuthorizationSnapshotResponse:
+    """Return current policy and auditor state from one read transaction.
+
+    The caller performs policy evaluation and auditor persistence first. This
+    read transaction then recomputes policy and derives assessment currentness
+    against the same SQLite snapshot, so the two public results cannot describe
+    different database revisions.
+    """
+    async with get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN")
+        try:
+            proposal = await get_proposal(proposal_id, db=db)
+            mandate = await get_mandate_from_db(proposal.mandate_id, db=db)
+            if mandate is None or mandate.owner_user_id != owner_user_id:
+                raise ProposalNotFoundError("Proposal not found.")
+
+            now = datetime.now(timezone.utc)
+            decision = await current_policy_decision(
+                proposal, mandate, db=db, now=now
+            )
+            cursor = await db.execute(
+                "SELECT assessment_id, proposal_id, mandate_id, status, risk_level, "
+                "finding_codes_json, affected_fields_json, proposal_content_hash, "
+                "mandate_permissions_hash, policy_snapshot_hash, policy_version, "
+                "schema_version, prompt_version, model_identifier, failure_code, created_at "
+                "FROM intent_assessments WHERE proposal_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (proposal_id,),
+            )
+            row = await cursor.fetchone()
+            public_assessment = None
+            if row is not None:
+                record = _assessment_record_from_row(row)
+                if (record.status == IntentAssessmentStatus.FAILED
+                        and record.risk_level != IntentRiskLevel.UNCERTAIN):
+                    raise AssessmentRetrievalError(
+                        "Persisted failed assessment data is invalid."
+                    )
+                created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                current = await _assessment_is_current(
+                    record, proposal, mandate, db=db, now=now
+                )
+                public_assessment = PublicIntentAssessment(
+                    status=record.status,
+                    risk_level=record.risk_level,
+                    finding_codes=record.finding_codes,
+                    affected_fields=record.affected_fields,
+                    created_at=created_at,
+                    is_current=current,
+                )
+
+            result = AuthorizationSnapshotResponse(
+                proposal_id=proposal_id,
+                proposal_status=proposal.status,
+                policy_decision=public_policy_decision(decision),
+                assessment=public_assessment,
+            )
+            await db.commit()
+            return result
+        except (AssessmentRetrievalError, ProposalNotFoundError):
+            await db.rollback()
+            raise
+        except Exception as exc:
+            await db.rollback()
+            if isinstance(exc, (ValidationError, aiosqlite.Error, TypeError, ValueError)):
+                raise AssessmentRetrievalError(
+                    "Authorization snapshot data is invalid or unavailable."
+                ) from exc
             raise

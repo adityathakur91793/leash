@@ -1,4 +1,5 @@
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { useProposals } from '../hooks/useProposals';
 import { ProposalInbox } from '../components/ProposalInbox';
@@ -7,19 +8,47 @@ import * as api from '../services/proposals';
 
 const proposal = { proposal_id: 'pr_1', mandate_id: 'man_1', product_id: 'p1', product_name: '<b>Unsafe</b>', merchant: 'shop.example', category: 'books', quantity: 2, unit_price: '4.00', currency: 'USD', tax: '0.00', shipping: '0.00', other_charges: '0.00', subtotal: '8.00', total: '8.00', product_source: 'https://shop.example/p1', status: 'SUBMITTED', created_at: '2030-01-01T00:00:00Z', fingerprint: 'hidden', content_hash: 'hidden' };
 
-function rule(overrides = {}) {
+const publicChecks = [
+  'Checks mandate signature integrity.',
+  'Checks that the mandate is active and unexpired.',
+  "Checks the mandate's total budget limit.",
+  'Checks the per-item price limit.',
+  'Checks whether the merchant is eligible.',
+  'Checks whether the product category is eligible.',
+  'Checks item quantity limits.',
+  'Checks currency consistency.',
+  'Checks live-price policy requirements.',
+  'Checks the daily spend limit.',
+  'Checks for duplicate or replayed proposals.',
+  'Checks proposal data integrity.',
+];
+
+function rule(index, outcome = 'PASS') {
+  const explanation = {
+    PASS: 'This check passed.',
+    BLOCK: 'This check blocks the proposal.',
+    REQUIRE_APPROVAL: 'This check requires separate user review.',
+    NOT_APPLICABLE: 'This check does not apply to this proposal.',
+  }[outcome];
   return {
-    rule_id: 'P01', rule_name: 'Mandate status', status: 'PASS',
-    reason: 'The mandate is active.', evidence: {}, evaluated_at: '2030-01-01T00:00:00Z',
-    ...overrides,
+    rule_id: `P${String(index).padStart(2, '0')}`,
+    outcome,
+    severity: outcome === 'BLOCK' ? 'BLOCKING'
+      : outcome === 'REQUIRE_APPROVAL' ? 'REVIEW' : 'INFORMATIONAL',
+    explanation: `${publicChecks[index - 1]} ${explanation}`,
+    requires_user_review: outcome === 'REQUIRE_APPROVAL',
   };
 }
 
 function policyDecision(overrides = {}) {
+  const decision = overrides.decision || 'ALLOW';
+  const rules = overrides.rules || Array.from({ length: 12 }, (_, index) => (
+    decision === 'BLOCK' && index === 0 ? rule(index + 1, 'BLOCK')
+      : decision === 'REQUIRE_APPROVAL' && index === 3
+        ? rule(index + 1, 'REQUIRE_APPROVAL') : rule(index + 1)
+  ));
   return {
-    proposal_id: 'pr_1', mandate_id: 'man_1', decision: 'ALLOW',
-    decision_at: '2030-01-01T00:00:00Z', rules: [rule()], blocking_rules: [],
-    approval_required_rules: [], is_one_time_exception: false, exception_types: [],
+    decision, rules,
     ...overrides,
   };
 }
@@ -40,7 +69,103 @@ function Harness({ onState }) {
   return <ProposalInbox proposals={state} />;
 }
 
+function AuthorizationLifecycleHarness({ sessionToken = 'session-one', sessionIdentity = 'user-one' }) {
+  const [selectedId, setSelectedId] = useState('pr_1');
+  const [selectionRevision, setSelectionRevision] = useState(0);
+  const selectedProposal = { ...proposal, proposal_id: selectedId, product_name: `Product ${selectedId}` };
+  const assessment = {
+    status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+    created_at: '2030-01-01T00:00:00Z', is_current: true,
+  };
+  const state = {
+    items: [proposal, { ...proposal, proposal_id: 'pr_2', product_name: 'Product pr_2' }],
+    selectedId, selectionRevision, detail: { ...selectedProposal, status: 'EVALUATED' },
+    decision: policyDecision(), loading: false, detailLoading: false, evaluating: false,
+    error: null,
+    intentAssessment: { assessment, loaded: true, loading: false, unavailable: false, error: null },
+    refresh: vi.fn(), evaluate: vi.fn(),
+    select: (id) => { setSelectedId(id); setSelectionRevision((value) => value + 1); },
+  };
+  return <ProposalInbox proposals={state} sessionToken={sessionToken} sessionIdentity={sessionIdentity} />;
+}
+
 describe('proposal inbox', () => {
+  it('invalidates a snapshot when the same proposal is reopened and requires a fresh read', async () => {
+    const first = deferred();
+    const second = deferred();
+    vi.spyOn(api, 'refreshProposalAuthorization')
+      .mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const view = render(<AuthorizationLifecycleHarness />);
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    await act(async () => first.resolve({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED',
+      policyDecision: policyDecision(),
+      assessment: { status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+        created_at: '2030-01-01T00:00:00Z', is_current: true },
+    }));
+    expect(screen.getByText('Current assessment')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Unsafe/ }));
+    expect(screen.getByText('Not current')).toBeInTheDocument();
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    await act(async () => second.resolve({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED',
+      policyDecision: policyDecision(),
+      assessment: { status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+        created_at: '2030-01-01T00:00:00Z', is_current: true },
+    }));
+    expect(screen.getByText('Current assessment')).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it('does not restore a previous session snapshot from an in-flight refresh', async () => {
+    const pending = deferred();
+    vi.spyOn(api, 'refreshProposalAuthorization').mockReturnValue(pending.promise);
+    const view = render(<AuthorizationLifecycleHarness />);
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    view.rerender(<AuthorizationLifecycleHarness sessionToken="session-two" sessionIdentity="user-two" />);
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    await act(async () => pending.resolve({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED', policyDecision: policyDecision(),
+      assessment: { status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+        created_at: '2030-01-01T00:00:00Z', is_current: true },
+    }));
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    expect(screen.getByText('Not current')).toBeInTheDocument();
+    view.unmount();
+  });
+
+  it('clears cached authorization display when the session expires', async () => {
+    vi.spyOn(api, 'refreshProposalAuthorization').mockResolvedValue({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED', policyDecision: policyDecision(),
+      assessment: { status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+        created_at: '2030-01-01T00:00:00Z', is_current: true },
+    });
+    const view = render(<AuthorizationLifecycleHarness />);
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    await screen.findByText('Current assessment');
+    view.rerender(<AuthorizationLifecycleHarness sessionToken={null} sessionIdentity="user-one" />);
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    expect(screen.getByText('Not current')).toBeInTheDocument();
+  });
+
+  it('ignores proposal A refresh when switching to proposal B', async () => {
+    const pending = deferred();
+    vi.spyOn(api, 'refreshProposalAuthorization').mockReturnValue(pending.promise);
+    render(<AuthorizationLifecycleHarness />);
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Product pr_2/ }));
+    expect(screen.getByText('Not current')).toBeInTheDocument();
+    await act(async () => pending.resolve({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED', policyDecision: policyDecision(),
+      assessment: { status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+        created_at: '2030-01-01T00:00:00Z', is_current: true },
+    }));
+    expect(screen.queryByText('Current assessment')).not.toBeInTheDocument();
+    expect(screen.getByText('Not current')).toBeInTheDocument();
+  });
   it('loads owned proposals, selects details, and renders untrusted text without HTML execution', async () => {
     vi.spyOn(api, 'listProposals').mockResolvedValue([proposal]);
     vi.spyOn(api, 'getProposal').mockResolvedValue(proposal);
@@ -56,16 +181,52 @@ describe('proposal inbox', () => {
     vi.spyOn(api, 'listProposals').mockResolvedValue([proposal]);
     vi.spyOn(api, 'getProposal').mockResolvedValue(proposal);
     vi.spyOn(api, 'evaluateProposal').mockResolvedValue(policyDecision({
-      decision: 'BLOCK', rules: [rule({ status: 'BLOCK', reason: 'Outside policy.' })],
-      blocking_rules: ['P01'],
+      decision: 'BLOCK',
     }));
     render(<Harness />);
     fireEvent.click(await screen.findByRole('button', { name: /Unsafe/ }));
     fireEvent.click(await screen.findByRole('button', { name: /evaluate with backend/i }));
     expect((await screen.findAllByText('BLOCK')).length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText('Blocking rules: P01')).toBeInTheDocument();
-    expect(screen.getByText('P01: Mandate status')).toBeInTheDocument();
+    expect(screen.getByText('P01')).toBeInTheDocument();
+    expect(screen.getByText(/Checks mandate signature integrity\. This check blocks the proposal\./)).toBeInTheDocument();
     expect(screen.getByText(/not user approval/i)).toBeInTheDocument();
+  });
+
+  it('updates proposal status only after the consent response is confirmed by the backend', async () => {
+    const freshAssessment = {
+      status: 'VALID', risk_level: 'LOW', finding_codes: [], affected_fields: [],
+      created_at: '2030-01-01T00:00:00Z', is_current: true,
+    };
+    vi.spyOn(api, 'refreshProposalAuthorization').mockResolvedValue({
+      proposalId: 'pr_1', proposalStatus: 'EVALUATED',
+      policyDecision: policyDecision(), assessment: freshAssessment,
+    });
+    vi.spyOn(api, 'recordPurchaseConsent').mockResolvedValue({
+      proposal_id: 'pr_1', status: 'APPROVED', policy_decision: 'ALLOW',
+      amount: '8.00', currency: 'USD', consented_at: '2030-01-01T00:00:00Z',
+      idempotent: false,
+    });
+    render(<ProposalInbox
+      proposals={{
+        items: [proposal], selectedId: 'pr_1', detail: { ...proposal, status: 'EVALUATED' },
+        decision: policyDecision(), loading: false, detailLoading: false, evaluating: false,
+        error: null, intentAssessment: {
+          assessment: freshAssessment, loaded: true, loading: false, unavailable: false,
+          error: null, refresh: vi.fn(),
+        },
+        refresh: vi.fn(), select: vi.fn(), evaluate: vi.fn(),
+      }}
+      sessionToken="session-token"
+      sessionIdentity="user-1"
+      onSessionExpired={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /refresh policy and assessment/i }));
+    await screen.findByText('Current assessment');
+    fireEvent.click(screen.getByRole('button', { name: /continue to purchase consent/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /confirm purchase consent/i }));
+    expect(await screen.findByText(/LEASH confirmed proposal status: APPROVED/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('APPROVED')).toBeInTheDocument());
   });
 
   it('shows empty state and prevents stale detail from replacing a newer selection', async () => {
@@ -181,7 +342,7 @@ describe('proposal inbox', () => {
     render(<Harness />);
     fireEvent.click(await screen.findByRole('button', { name: /Unsafe/ }));
     fireEvent.click(await screen.findByRole('button', { name: /evaluate with backend/i }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/invalid policy evaluation/i);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/invalid authorization policy decision/i);
     expect(screen.queryByText('MAYBE')).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '<b>Unsafe</b>' })).toBeInTheDocument();
   });
@@ -193,7 +354,7 @@ describe('proposal inbox', () => {
     render(<Harness />);
     fireEvent.click(await screen.findByRole('button', { name: /Unsafe/ }));
     fireEvent.click(await screen.findByRole('button', { name: /evaluate with backend/i }));
-    expect(await screen.findByRole('alert')).toHaveTextContent(/invalid policy evaluation/i);
+    expect(await screen.findByRole('alert')).toHaveTextContent(/invalid authorization policy decision/i);
     expect(screen.queryByText('ALLOW')).not.toBeInTheDocument();
   });
 

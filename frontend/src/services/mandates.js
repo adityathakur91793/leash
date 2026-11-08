@@ -18,7 +18,7 @@ const CREATE_FIELDS = [
 ];
 
 const STATUSES = new Set(['DRAFT', 'CONFIRMED', 'SIGNED', 'ACTIVE', 'EXPIRED', 'REVOKED']);
-const CURRENCIES = new Set(['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY']);
+export const SUPPORTED_CURRENCIES = Object.freeze(['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY']);
 
 function isDate(value) {
   return typeof value === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
@@ -66,7 +66,7 @@ function isCompleteMandate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const strings = ['mandate_id', 'schema_version'];
   if (strings.some((field) => typeof value[field] !== 'string' || !value[field].trim())) return false;
-  if (!STATUSES.has(value.status) || !CURRENCIES.has(value.currency)) return false;
+  if (!STATUSES.has(value.status) || !SUPPORTED_CURRENCIES.includes(value.currency)) return false;
   if (!isDecimal(value.max_total_budget)) return false;
   if (!Array.isArray(value.allowed_merchants) || !value.allowed_merchants.length
     || value.allowed_merchants.some((item) => typeof item !== 'string' || !item.trim())) return false;

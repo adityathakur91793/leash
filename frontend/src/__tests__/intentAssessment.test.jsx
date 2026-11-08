@@ -33,6 +33,31 @@ function payload(proposalId = 'pr_1', assessment = currentAssessment) {
   return { proposal_id: proposalId, assessment };
 }
 
+function publicPolicyDecision() {
+  const checks = [
+    'Checks mandate signature integrity.',
+    'Checks that the mandate is active and unexpired.',
+    "Checks the mandate's total budget limit.",
+    'Checks the per-item price limit.',
+    'Checks whether the merchant is eligible.',
+    'Checks whether the product category is eligible.',
+    'Checks item quantity limits.',
+    'Checks currency consistency.',
+    'Checks live-price policy requirements.',
+    'Checks the daily spend limit.',
+    'Checks for duplicate or replayed proposals.',
+    'Checks proposal data integrity.',
+  ];
+  return {
+    decision: 'ALLOW',
+    rules: checks.map((check, index) => ({
+      rule_id: `P${String(index + 1).padStart(2, '0')}`,
+      outcome: 'PASS', severity: 'INFORMATIONAL',
+      explanation: `${check} This check passed.`, requires_user_review: false,
+    })),
+  };
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -324,11 +349,7 @@ describe('useIntentAssessment', () => {
       .mockResolvedValueOnce(null).mockResolvedValueOnce(currentAssessment);
     vi.spyOn(proposalApi, 'listProposals').mockResolvedValue([proposal]);
     vi.spyOn(proposalApi, 'getProposal').mockResolvedValue(proposal);
-    vi.spyOn(proposalApi, 'evaluateProposal').mockResolvedValue({
-      proposal_id: 'pr_1', mandate_id: 'man_1', decision: 'ALLOW',
-      decision_at: '2030-01-01T00:00:00Z', rules: [], blocking_rules: [],
-      approval_required_rules: [], is_one_time_exception: false, exception_types: [],
-    });
+    vi.spyOn(proposalApi, 'evaluateProposal').mockResolvedValue(publicPolicyDecision());
     const onSessionExpired = vi.fn();
     const hook = renderHook(() => {
       const proposals = useProposals('token', onSessionExpired);

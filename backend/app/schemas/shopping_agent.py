@@ -7,7 +7,7 @@ import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.mandate import MERCHANT_IDENTIFIER_REGEX, SUPPORTED_CURRENCIES
-from app.schemas.policy import PolicyDecision
+from app.schemas.authorization import PublicPolicyDecision
 from app.schemas.proposal import MAX_QUANTITY, ProposalStatus
 
 PRODUCT_ID_PATTERN = re.compile(r"^demo_[a-z0-9][a-z0-9_-]{0,62}$")
@@ -211,7 +211,7 @@ class ProductLookupResult(StrictSchema):
 class ProposalToolResult(StrictSchema):
     proposal_id: str
     status: ProposalStatus
-    policy_decision: PolicyDecision
+    policy_decision: PublicPolicyDecision
     simulated: bool = True
 
 

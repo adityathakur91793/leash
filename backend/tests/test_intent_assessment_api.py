@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import asyncio
 import json
 
 import aiosqlite
@@ -346,3 +347,243 @@ async def test_malformed_persisted_assessment_fails_safely_without_internal_data
     assert response.status_code == 503
     assert response.json() == {"detail": "Assessment data is unavailable."}
     assert "hash" not in response.text.lower()
+
+
+async def test_authorization_snapshot_returns_policy_and_assessment_together(
+    client: httpx.AsyncClient,
+) -> None:
+    proposal_id, _, headers = await _create_owned_proposal(client)
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {
+        "proposal_id", "proposal_status", "policy_decision", "assessment",
+    }
+    assert body["proposal_id"] == proposal_id
+    assert body["proposal_status"] == "EVALUATED"
+    assert body["policy_decision"]["decision"] == "REQUIRE_APPROVAL"
+    assert set(body["policy_decision"]) == {"decision", "rules"}
+    assert len(body["policy_decision"]["rules"]) == 12
+    assert {rule["rule_id"] for rule in body["policy_decision"]["rules"]} == {
+        f"P{index:02d}" for index in range(1, 13)
+    }
+    for rule in body["policy_decision"]["rules"]:
+        assert set(rule) == {
+            "rule_id", "outcome", "severity", "explanation", "requires_user_review",
+        }
+        assert "evidence" not in rule
+        assert "hash" not in rule["explanation"].lower()
+        assert "fingerprint" not in rule["explanation"].lower()
+        assert "idempotency" not in rule["explanation"].lower()
+        assert "http" not in rule["explanation"].lower()
+    assert body["assessment"]["status"] == "VALID"
+    assert body["assessment"]["is_current"] is True
+    assert not any(
+        key in response.text.lower()
+        for key in ("content_hash", "fingerprint", "idempotency_key", "assessment_binding")
+    )
+
+
+async def test_authorization_snapshot_does_not_pair_old_policy_with_new_assessment_revision(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1 import proposals as proposal_api
+
+    proposal_id, mandate_id, headers = await _create_owned_proposal(client)
+    evaluate = proposal_api.evaluate_proposal_service
+
+    async def evaluate_then_change_policy(target_id: str):
+        result = await evaluate(target_id)
+        mandate = await get_mandate(mandate_id)
+        changed = mandate.model_copy(update={"require_user_approval": False})
+        changed.signature = sign_payload(
+            changed.canonical_payload(), settings.MANDATE_SIGNING_KEY
+        )
+        async with aiosqlite.connect(get_db_path()) as db:
+            await db.execute(
+                "UPDATE mandates SET require_user_approval = 0, signature = ? "
+                "WHERE mandate_id = ?",
+                (changed.signature, mandate_id),
+            )
+            await db.commit()
+        return result
+
+    monkeypatch.setattr(
+        proposal_api, "evaluate_proposal_service", evaluate_then_change_policy,
+    )
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # Evaluation produced REQUIRE_APPROVAL; the read snapshot sees the changed
+    # ALLOW policy and marks the earlier auditor assessment as noncurrent.
+    assert body["policy_decision"]["decision"] == "ALLOW"
+    assert body["assessment"]["status"] == "VALID"
+    assert body["assessment"]["is_current"] is False
+
+
+async def test_authorization_snapshot_marks_assessment_stale_after_proposal_mutation(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1 import proposals as proposal_api
+
+    proposal_id, _, headers = await _create_owned_proposal(client)
+    evaluate = proposal_api.evaluate_proposal_service
+
+    async def evaluate_then_mutate_proposal(target_id: str):
+        result = await evaluate(target_id)
+        proposal = await get_proposal(target_id)
+        changed = proposal.model_copy(update={
+            "product_name": "Mutated after evaluation",
+            "fingerprint": "",
+            "content_hash": "",
+        })
+        changed.fingerprint = proposal_fingerprint(changed.model_dump())
+        changed.content_hash = proposal_content_hash(changed.model_dump())
+        async with aiosqlite.connect(get_db_path()) as db:
+            await db.execute(
+                "UPDATE proposals SET product_name = ?, fingerprint = ?, content_hash = ? "
+                "WHERE proposal_id = ?",
+                (changed.product_name, changed.fingerprint, changed.content_hash, target_id),
+            )
+            await db.commit()
+        return result
+
+    monkeypatch.setattr(proposal_api, "evaluate_proposal_service", evaluate_then_mutate_proposal)
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["policy_decision"]["decision"] == "REQUIRE_APPROVAL"
+    assert body["assessment"]["is_current"] is False
+
+
+async def test_authorization_snapshot_fails_closed_when_assessment_revision_mismatches(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1 import proposals as proposal_api
+
+    proposal_id, _, headers = await _create_owned_proposal(client)
+    evaluate = proposal_api.evaluate_proposal_service
+
+    async def evaluate_then_replace_assessment_binding(target_id: str):
+        result = await evaluate(target_id)
+        async with aiosqlite.connect(get_db_path()) as db:
+            await db.execute(
+                "UPDATE intent_assessments SET policy_snapshot_hash = ? "
+                "WHERE assessment_id = (SELECT assessment_id FROM intent_assessments "
+                "WHERE proposal_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1)",
+                ("0" * 64, target_id),
+            )
+            await db.commit()
+        return result
+
+    monkeypatch.setattr(
+        proposal_api, "evaluate_proposal_service", evaluate_then_replace_assessment_binding,
+    )
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    assert response.json()["assessment"]["is_current"] is False
+
+
+async def test_authorization_snapshot_returns_block_without_assessment(
+    client: httpx.AsyncClient,
+) -> None:
+    proposal_id, mandate_id, headers = await _create_owned_proposal(client)
+    async with aiosqlite.connect(get_db_path()) as db:
+        await db.execute(
+            "UPDATE mandates SET status = 'REVOKED' WHERE mandate_id = ?", (mandate_id,)
+        )
+        await db.commit()
+
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal_status"] == "REJECTED"
+    assert body["policy_decision"]["decision"] == "BLOCK"
+    assert body["assessment"] is None
+
+
+async def test_authorization_snapshot_keeps_missing_nonblock_assessment_unusable(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1 import proposals as proposal_api
+
+    proposal_id, _, headers = await _create_owned_proposal(client)
+    evaluate = proposal_api.evaluate_proposal_service
+
+    async def evaluate_then_remove_assessment(target_id: str):
+        result = await evaluate(target_id)
+        async with aiosqlite.connect(get_db_path()) as db:
+            await db.execute(
+                "DELETE FROM intent_assessments WHERE proposal_id = ?", (target_id,)
+            )
+            await db.commit()
+        return result
+
+    monkeypatch.setattr(proposal_api, "evaluate_proposal_service", evaluate_then_remove_assessment)
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/authorization-snapshot", headers=headers
+    )
+    assert response.status_code == 200
+    assert response.json()["policy_decision"]["decision"] == "REQUIRE_APPROVAL"
+    assert response.json()["assessment"] is None
+
+
+async def test_concurrent_authorization_reevaluations_return_current_snapshots(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api.v1 import proposals as proposal_api
+
+    proposal_id, _, headers = await _create_owned_proposal(client)
+    evaluate = proposal_api.evaluate_proposal_service
+    evaluations_complete = asyncio.Event()
+    evaluation_count = 0
+
+    async def concurrent_evaluate(target_id: str):
+        nonlocal evaluation_count
+        result = await evaluate(target_id)
+        evaluation_count += 1
+        if evaluation_count == 2:
+            evaluations_complete.set()
+        await evaluations_complete.wait()
+        return result
+
+    monkeypatch.setattr(proposal_api, "evaluate_proposal_service", concurrent_evaluate)
+    path = f"/api/v1/proposals/{proposal_id}/authorization-snapshot"
+    responses = await asyncio.gather(
+        client.post(path, headers=headers), client.post(path, headers=headers)
+    )
+    assert all(response.status_code == 200 for response in responses)
+    for response in responses:
+        body = response.json()
+        assert body["policy_decision"]["decision"] == "REQUIRE_APPROVAL"
+        assert body["assessment"]["status"] == "VALID"
+        assert body["assessment"]["is_current"] is True
+
+
+async def test_authorization_snapshot_is_owner_scoped_and_requires_auth(
+    client: httpx.AsyncClient,
+) -> None:
+    proposal_id, _, owner_headers = await _create_owned_proposal(client)
+    session = await client.post("/api/v1/sessions", json={})
+    foreign_headers = {"Authorization": f"Bearer {session.json()['session_token']}"}
+    path = f"/api/v1/proposals/{proposal_id}/authorization-snapshot"
+
+    assert (await client.post(path)).status_code == 401
+    foreign = await client.post(path, headers=foreign_headers)
+    missing = await client.post(
+        "/api/v1/proposals/prp_does-not-exist/authorization-snapshot",
+        headers=foreign_headers,
+    )
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json() == missing.json()
+    assert (await client.post(path, headers=owner_headers)).status_code == 200

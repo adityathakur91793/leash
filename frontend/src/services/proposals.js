@@ -1,4 +1,5 @@
 import { ApiError, request } from './api';
+import { SUPPORTED_CURRENCIES } from './mandates';
 
 const PROPOSAL_STATUSES = new Set([
   'SUBMITTED', 'EVALUATED', 'APPROVED', 'SETTLED', 'REJECTED', 'WITHDRAWN',
@@ -16,6 +17,31 @@ const ASSESSMENT_FIELDS = new Set([
   'product_name', 'merchant', 'category', 'quantity', 'unit_price', 'total', 'currency',
   'mandate_budget', 'allowed_merchants', 'allowed_categories', 'item_limits', 'subscriptions',
 ]);
+const POLICY_RULE_IDS = new Set(Array.from({ length: 12 }, (_, index) => (
+  `P${String(index + 1).padStart(2, '0')}`
+)));
+const PUBLIC_RULE_OUTCOMES = new Set(['PASS', 'BLOCK', 'REQUIRE_APPROVAL', 'NOT_APPLICABLE']);
+const PUBLIC_RULE_SEVERITIES = new Set(['INFORMATIONAL', 'REVIEW', 'BLOCKING']);
+const PUBLIC_RULE_CHECKS = {
+  P01: 'Checks mandate signature integrity.',
+  P02: 'Checks that the mandate is active and unexpired.',
+  P03: "Checks the mandate's total budget limit.",
+  P04: 'Checks the per-item price limit.',
+  P05: 'Checks whether the merchant is eligible.',
+  P06: 'Checks whether the product category is eligible.',
+  P07: 'Checks item quantity limits.',
+  P08: 'Checks currency consistency.',
+  P09: 'Checks live-price policy requirements.',
+  P10: 'Checks the daily spend limit.',
+  P11: 'Checks for duplicate or replayed proposals.',
+  P12: 'Checks proposal data integrity.',
+};
+const PUBLIC_OUTCOME_TEXT = {
+  PASS: 'This check passed.',
+  BLOCK: 'This check blocks the proposal.',
+  REQUIRE_APPROVAL: 'This check requires separate user review.',
+  NOT_APPLICABLE: 'This check does not apply to this proposal.',
+};
 const MONEY_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const TEXT_PATTERN = /^[^\u0000-\u001f\u007f]+$/;
@@ -113,7 +139,7 @@ function isRule(value) {
     && RULE_STATUSES.has(value.status)
     && typeof value.reason === 'string'
     && isRecord(value.evidence)
-    && isTimestamp(value.evaluated_at);
+    && isStrictTimestamp(value.evaluated_at);
 }
 
 export function validatePolicyDecision(value, expectedProposalId, expectedMandateId) {
@@ -122,7 +148,7 @@ export function validatePolicyDecision(value, expectedProposalId, expectedMandat
     && isId(value.mandate_id)
     && (expectedMandateId === undefined || value.mandate_id === expectedMandateId)
     && DECISIONS.has(value.decision)
-    && isTimestamp(value.decision_at)
+    && isStrictTimestamp(value.decision_at)
     && Array.isArray(value.rules) && value.rules.every(isRule)
     && Array.isArray(value.blocking_rules) && value.blocking_rules.every((item) => isText(item, 32))
     && Array.isArray(value.approval_required_rules)
@@ -131,6 +157,42 @@ export function validatePolicyDecision(value, expectedProposalId, expectedMandat
     && Array.isArray(value.exception_types)
     && value.exception_types.every((item) => isText(item, 64));
   if (!valid) invalidResponse('policy evaluation');
+  return value;
+}
+
+export function validatePublicPolicyDecision(value) {
+  if (!isRecord(value) || !hasExactKeys(value, ['decision', 'rules'])
+      || !DECISIONS.has(value.decision) || !Array.isArray(value.rules)
+      || value.rules.length !== POLICY_RULE_IDS.size) {
+    invalidResponse('authorization policy decision');
+  }
+
+  const expectedRuleKeys = [
+    'rule_id', 'outcome', 'severity', 'explanation', 'requires_user_review',
+  ];
+  const validRules = value.rules.every((rule) => {
+    if (!isRecord(rule) || !hasExactKeys(rule, expectedRuleKeys)
+        || !POLICY_RULE_IDS.has(rule.rule_id)
+        || !PUBLIC_RULE_OUTCOMES.has(rule.outcome)
+        || !PUBLIC_RULE_SEVERITIES.has(rule.severity)
+        || typeof rule.requires_user_review !== 'boolean') return false;
+    const expectedSeverity = rule.outcome === 'BLOCK' ? 'BLOCKING'
+      : rule.outcome === 'REQUIRE_APPROVAL' ? 'REVIEW' : 'INFORMATIONAL';
+    return rule.severity === expectedSeverity
+      && rule.requires_user_review === (rule.outcome === 'REQUIRE_APPROVAL')
+      && rule.explanation === `${PUBLIC_RULE_CHECKS[rule.rule_id]} ${PUBLIC_OUTCOME_TEXT[rule.outcome]}`;
+  });
+  if (!validRules) invalidResponse('authorization policy decision');
+  const ids = value.rules.map((rule) => rule.rule_id);
+  const outcomes = new Set(value.rules.map((rule) => rule.outcome));
+  const coherentDecision = outcomes.has('BLOCK')
+    ? value.decision === 'BLOCK'
+    : outcomes.has('REQUIRE_APPROVAL')
+      ? value.decision === 'REQUIRE_APPROVAL'
+      : value.decision !== 'BLOCK';
+  if (new Set(ids).size !== POLICY_RULE_IDS.size || !coherentDecision) {
+    invalidResponse('authorization policy decision');
+  }
   return value;
 }
 
@@ -166,7 +228,10 @@ export function getProposal(token, proposalId) {
 }
 
 export function evaluateProposal(token, proposalId) {
-  return request(`/api/v1/proposals/${encodeURIComponent(proposalId)}/evaluate-review`, { method: 'POST', token });
+  return request(
+    `/api/v1/proposals/${encodeURIComponent(proposalId)}/evaluate-review`,
+    { method: 'POST', token },
+  ).then(validatePublicPolicyDecision);
 }
 
 export async function getIntentAssessment(token, proposalId) {
@@ -175,4 +240,129 @@ export async function getIntentAssessment(token, proposalId) {
     { token },
   );
   return validateIntentAssessmentResponse(response, proposalId);
+}
+
+/** Request one backend-produced policy and auditor snapshot. */
+export async function refreshProposalAuthorization(token, proposalId) {
+  const response = await request(
+    `/api/v1/proposals/${encodeURIComponent(proposalId)}/authorization-snapshot`,
+    { method: 'POST', token },
+  );
+  if (!isRecord(response) || !hasExactKeys(response, [
+    'proposal_id', 'proposal_status', 'policy_decision', 'assessment',
+  ])) {
+    invalidResponse('authorization snapshot');
+  }
+  return validateAuthorizationSnapshot({
+    proposalId: response.proposal_id,
+    proposalStatus: response.proposal_status,
+    policyDecision: response.policy_decision,
+    assessment: response.assessment,
+  }, proposalId);
+}
+
+export function validateAuthorizationSnapshot(value, expectedProposalId) {
+  const valid = isRecord(value)
+    && hasExactKeys(value, ['proposalId', 'proposalStatus', 'policyDecision', 'assessment'])
+    && value.proposalId === expectedProposalId
+    && PROPOSAL_STATUSES.has(value.proposalStatus)
+    && validatePublicPolicyDecision(value.policyDecision)
+    && ((value.assessment === null && value.policyDecision.decision === 'BLOCK')
+      || (value.assessment !== null
+        && validateIntentAssessmentResponse({
+          proposal_id: expectedProposalId,
+          assessment: value.assessment,
+        }, expectedProposalId) !== undefined
+        && (value.policyDecision.decision === 'BLOCK'
+          || (value.assessment.status === 'VALID'
+            && value.assessment.is_current === true
+            && ['LOW', 'MEDIUM', 'HIGH'].includes(value.assessment.risk_level)))));
+  const lifecycleMatches = isRecord(value)
+    && (value.policyDecision?.decision === 'BLOCK'
+      ? value.proposalStatus === 'REJECTED'
+      : value.proposalStatus === 'EVALUATED');
+  if (!valid || !lifecycleMatches) invalidResponse('authorization snapshot');
+  return value;
+}
+
+function validateApprovalTokenResponse(value, expectedProposalId) {
+  const valid = isRecord(value)
+    && hasExactKeys(value, ['proposal_id', 'token', 'issued_at', 'expires_at', 'nonce'])
+    && value.proposal_id === expectedProposalId
+    && isText(value.token, 200)
+    && isStrictTimestamp(value.issued_at)
+    && isStrictTimestamp(value.expires_at)
+    && Date.parse(value.expires_at) > Date.parse(value.issued_at)
+    && isText(value.nonce, 200);
+  if (!valid) invalidResponse('approval token');
+  return value;
+}
+
+export async function issueApprovalToken(token, proposalId) {
+  const response = await request(
+    `/api/v1/proposals/${encodeURIComponent(proposalId)}/approval-token`,
+    {
+      method: 'POST',
+      token,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: proposalId }),
+    },
+  );
+  return validateApprovalTokenResponse(response, proposalId);
+}
+
+export async function consumeApprovalToken(token, proposalId, approval) {
+  const response = await request(
+    `/api/v1/proposals/${encodeURIComponent(proposalId)}/approve`,
+    {
+      method: 'POST',
+      token,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        proposal_id: proposalId,
+        token: approval.token,
+        issued_at: approval.issued_at,
+        nonce: approval.nonce,
+      }),
+    },
+  );
+  const valid = isRecord(response)
+    && hasExactKeys(response, ['success', 'proposal_id', 'reason'])
+    && response.success === true
+    && response.proposal_id === proposalId
+    && isText(response.reason);
+  if (!valid) invalidResponse('approval review');
+  return response;
+}
+
+function isPositiveAmount(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0;
+  return typeof value === 'string'
+    && /^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)
+    && /[1-9]/.test(value);
+}
+
+export async function recordPurchaseConsent(token, proposalId) {
+  const response = await request(
+    `/api/v1/proposals/${encodeURIComponent(proposalId)}/purchase-consent`,
+    {
+      method: 'POST',
+      token,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm_purchase: true }),
+    },
+  );
+  const valid = isRecord(response)
+    && hasExactKeys(response, [
+      'proposal_id', 'status', 'policy_decision', 'amount', 'currency', 'consented_at', 'idempotent',
+    ])
+    && response.proposal_id === proposalId
+    && response.status === 'APPROVED'
+    && ['ALLOW', 'REQUIRE_APPROVAL'].includes(response.policy_decision)
+    && isPositiveAmount(response.amount)
+    && SUPPORTED_CURRENCIES.includes(response.currency)
+    && isStrictTimestamp(response.consented_at)
+    && typeof response.idempotent === 'boolean';
+  if (!valid) invalidResponse('purchase consent');
+  return response;
 }

@@ -4,7 +4,7 @@ import {
   evaluateProposal,
   getProposal,
   listProposals,
-  validatePolicyDecision,
+  validatePublicPolicyDecision,
   validateProposalDetail,
   validateProposalList,
 } from '../services/proposals';
@@ -12,6 +12,7 @@ import {
 export function useProposals(token, onSessionExpired) {
   const [items, setItems] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
+  const [selectionRevision, setSelectionRevision] = useState(0);
   const [detail, setDetail] = useState(null);
   const [decision, setDecision] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -85,6 +86,7 @@ export function useProposals(token, onSessionExpired) {
     if (token) void refresh();
   }, [token, refresh]);
   const select = useCallback((id) => {
+    setSelectionRevision((revision) => revision + 1);
     detailId.current += 1;
     selectedIdRef.current = id;
     setSelectedId(id);
@@ -107,7 +109,7 @@ export function useProposals(token, onSessionExpired) {
       if (captured === tokenRef.current && gen === generation.current && req === detailId.current) setDetailLoading(false);
     });
     return () => { detailId.current += 1; };
-  }, [selectedId, token, handle]);
+  }, [selectedId, selectionRevision, token, handle]);
   const evaluate = useCallback(async () => {
     const captured = tokenRef.current; const id = selectedId;
     if (!captured || !id || !detail) return null;
@@ -117,7 +119,7 @@ export function useProposals(token, onSessionExpired) {
       const response = await evaluateProposal(captured, id);
       if (captured !== tokenRef.current || gen !== generation.current
           || req !== detailId.current || selectedIdRef.current !== id) return null;
-      const result = validatePolicyDecision(response, id, detail.mandate_id);
+      const result = validatePublicPolicyDecision(response);
       setDecision(result);
       setEvaluationRevision((revision) => revision + 1);
       try {
@@ -155,6 +157,6 @@ export function useProposals(token, onSessionExpired) {
   }, [detail, fetchList, handle, selectedId]);
   return {
     items, selectedId, detail, decision, loading, detailLoading, evaluating, error,
-    evaluationRevision, refresh, select, evaluate,
+    evaluationRevision, selectionRevision, refresh, select, evaluate,
   };
 }

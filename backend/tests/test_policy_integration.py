@@ -410,8 +410,20 @@ async def test_api_evaluate_proposal_endpoint(client: httpx.AsyncClient) -> None
     data = eval_res.json()
     assert data["decision"] == "ALLOW"
     assert len(data["rules"]) == 12
-    assert data["proposal_id"] == proposal_id
-    assert data["mandate_id"] == mandate_id
+    assert set(data) == {"decision", "rules"}
+    assert {rule["rule_id"] for rule in data["rules"]} == {
+        f"P{index:02d}" for index in range(1, 13)
+    }
+    assert all(set(rule) == {
+        "rule_id", "outcome", "severity", "explanation", "requires_user_review",
+    } for rule in data["rules"])
+    assert not any(
+        private_field in eval_res.text.lower()
+        for private_field in (
+            "mandate_id", "proposal_id", "fingerprint", "content_hash",
+            "idempotency_key", "product_source", "evidence",
+        )
+    )
 
 
 # --- Remediation Tests: Concurrency, Double-Counting, and Approval Tokens ---

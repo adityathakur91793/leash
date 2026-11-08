@@ -95,7 +95,12 @@ function App() {
             </section>
           )
         ) : activeView === 'proposals' ? (
-          session.status === 'active' ? <ProposalInbox proposals={proposalInboxState} /> : (
+          session.status === 'active' ? <ProposalInbox
+            proposals={proposalInboxState}
+            sessionToken={session.token}
+            sessionIdentity={session.userId}
+            onSessionExpired={session.markExpired}
+          /> : (
             <section className="mandate-card session-required"><Shield size={24} /><h2>Start a session to review proposals</h2><p>Proposals are scoped to your authenticated LEASH session.</p></section>
           )
         ) : activeView === 'shopping' ? (

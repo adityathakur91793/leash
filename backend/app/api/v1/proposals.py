@@ -9,7 +9,11 @@ from fastapi.responses import JSONResponse
 from app.api.dependencies import get_current_session
 from app.schemas.session import UserSession
 
-from app.schemas.policy import PolicyDecision
+from app.schemas.authorization import (
+    AuthorizationSnapshotResponse,
+    PublicPolicyDecision,
+    public_policy_decision,
+)
 from app.schemas.intent_audit import ProposalIntentAssessmentResponse
 from app.schemas.proposal import Proposal, ProposalCreate
 from app.services.mandate_service import MandateNotFoundError
@@ -25,7 +29,11 @@ from app.services.proposal_service import (
     list_proposals,
 )
 from app.services.intent_auditor_client import IntentAuditorUnavailable
-from app.services.intent_audit_service import AssessmentRetrievalError, get_owner_assessment
+from app.services.intent_audit_service import (
+    AssessmentRetrievalError,
+    get_owner_assessment,
+    get_owner_authorization_snapshot,
+)
 
 router = APIRouter(prefix="/proposals", tags=["Proposals"])
 
@@ -147,14 +155,15 @@ async def get_proposal_auditor_assessment_endpoint(
         ) from exc
 
 
-@router.post("/{proposal_id}/evaluate", response_model=PolicyDecision)
+@router.post("/{proposal_id}/evaluate", response_model=PublicPolicyDecision)
 async def evaluate_proposal_endpoint(
     proposal_id: str, session: UserSession = Depends(get_current_session)
-) -> PolicyDecision:
+) -> PublicPolicyDecision:
     """Evaluate only a proposal owned by the authenticated session principal."""
     try:
         await _owned_proposal_or_404(proposal_id, session.user_id)
-        return await evaluate_proposal_service(proposal_id)
+        decision = await evaluate_proposal_service(proposal_id)
+        return public_policy_decision(decision)
     except IntentAuditorUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="Intent assessment is unavailable; proposal remains on hold.") from exc
@@ -162,18 +171,46 @@ async def evaluate_proposal_endpoint(
         raise _http_for_proposal_errors(exc) from exc
 
 
-@router.post("/{proposal_id}/evaluate-review", response_model=PolicyDecision)
+@router.post("/{proposal_id}/evaluate-review", response_model=PublicPolicyDecision)
 async def evaluate_proposal_for_review_endpoint(
     proposal_id: str, session: UserSession = Depends(get_current_session)
-) -> PolicyDecision:
+) -> PublicPolicyDecision:
     """Evaluate policy and auditor for review without approving or paying."""
     try:
         await _owned_proposal_or_404(proposal_id, session.user_id)
-        return await evaluate_proposal_service(proposal_id)
+        decision = await evaluate_proposal_service(proposal_id)
+        return public_policy_decision(decision)
     except IntentAuditorUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Intent assessment is unavailable; proposal remains on hold.",
+        ) from exc
+    except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
+        raise _http_for_proposal_errors(exc) from exc
+
+
+@router.post(
+    "/{proposal_id}/authorization-snapshot",
+    response_model=AuthorizationSnapshotResponse,
+)
+async def get_authorization_snapshot_endpoint(
+    proposal_id: str,
+    session: UserSession = Depends(get_current_session),
+) -> AuthorizationSnapshotResponse:
+    """Evaluate, then return policy and auditor state from one read snapshot."""
+    try:
+        await _owned_proposal_or_404(proposal_id, session.user_id)
+        await evaluate_proposal_service(proposal_id)
+        return await get_owner_authorization_snapshot(proposal_id, session.user_id)
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A current valid intent assessment is required.",
+        ) from exc
+    except AssessmentRetrievalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authorization snapshot data is unavailable.",
         ) from exc
     except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc

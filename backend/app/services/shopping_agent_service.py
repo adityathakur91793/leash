@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from app.core.untrusted_content import inspect_untrusted_text
 from app.schemas.mandate import MandateStatus
+from app.schemas.authorization import public_policy_decision
 from app.schemas.proposal import ProposalCreate
 from app.schemas.shopping_agent import (
     ProductLookupArgs,
@@ -111,7 +112,7 @@ async def _propose_purchase(
     return ProposalToolResult(
         proposal_id=final_proposal.proposal_id,
         status=final_proposal.status,
-        policy_decision=decision,
+        policy_decision=public_policy_decision(decision),
         simulated=True,
     )
 
