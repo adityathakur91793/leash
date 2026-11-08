@@ -53,7 +53,7 @@ class _PayPalCallCounter:
 
 
 @pytest.mark.parametrize("risk", ["LOW", "MEDIUM", "HIGH"])
-async def test_auditor_risk_controls_automatic_approval_and_review(
+async def test_auditor_risk_never_approves_without_explicit_token(
     risk: str,
     attack_case: AttackCase,
     attack_factories: dict[str, Any],
@@ -92,18 +92,6 @@ async def test_auditor_risk_controls_automatic_approval_and_review(
         assert (await cursor.fetchone())[0] == risk
 
     paypal = _PayPalCallCounter(order_id=f"PAYPAL-MOCK-{risk}")
-    if risk == "LOW":
-        assert reviewed_proposal.status == ProposalStatus.APPROVED
-        order = await create_payment_order(
-            proposal.proposal_id,
-            attack_case.user_a.user_id,
-            paypal_client=paypal,  # type: ignore[arg-type]
-        )
-        assert order.status == PayPalOrderStatus.CREATED
-        assert paypal.create_calls == 1
-        assert (await verify_attack_audit_chain()).valid is True
-        return
-
     assert reviewed_proposal.status == ProposalStatus.EVALUATED
     with pytest.raises(PaymentProposalNotApprovedError):
         await create_payment_order(

@@ -137,3 +137,20 @@ async def evaluate_proposal_endpoint(
                             detail="Intent assessment is unavailable; proposal remains on hold.") from exc
     except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
         raise _http_for_proposal_errors(exc) from exc
+
+
+@router.post("/{proposal_id}/evaluate-review", response_model=PolicyDecision)
+async def evaluate_proposal_for_review_endpoint(
+    proposal_id: str, session: UserSession = Depends(get_current_session)
+) -> PolicyDecision:
+    """Evaluate policy and auditor for review without approving or paying."""
+    try:
+        await _owned_proposal_or_404(proposal_id, session.user_id)
+        return await evaluate_proposal_service(proposal_id)
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Intent assessment is unavailable; proposal remains on hold.",
+        ) from exc
+    except (ProposalNotFoundError, MandateNotFoundError, ProposalTamperedError) as exc:
+        raise _http_for_proposal_errors(exc) from exc

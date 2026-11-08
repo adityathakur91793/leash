@@ -6,6 +6,8 @@ import { StatusCard } from './components/StatusCard';
 import { ShoppingAgent } from './components/ShoppingAgent';
 import { MandateManager } from './components/MandateManager';
 import { useMandates } from './hooks/useMandates';
+import { useProposals } from './hooks/useProposals';
+import { ProposalInbox } from './components/ProposalInbox';
 import './App.css';
 
 function App() {
@@ -13,6 +15,7 @@ function App() {
   const session = useSession();
   const [activeView, setActiveView] = useState('mandates');
   const mandateState = useMandates(session.status === 'active' ? session.token : null, session.markExpired);
+  const proposalState = useProposals(session.status === 'active' ? session.token : null, session.markExpired);
 
   const sessionLabel = {
     loading: 'Connecting',
@@ -68,6 +71,7 @@ function App() {
         </section>
         <nav className="primary-nav" aria-label="Main navigation">
           <button type="button" aria-current={activeView === 'mandates' ? 'page' : undefined} className={activeView === 'mandates' ? 'nav-active' : ''} onClick={() => setActiveView('mandates')}><SlidersHorizontal size={17} /> Mandates</button>
+          <button type="button" aria-current={activeView === 'proposals' ? 'page' : undefined} className={activeView === 'proposals' ? 'nav-active' : ''} onClick={() => setActiveView('proposals')}>Proposal inbox</button>
           <button type="button" aria-current={activeView === 'shopping' ? 'page' : undefined} className={activeView === 'shopping' ? 'nav-active' : ''} onClick={() => setActiveView('shopping')}><ShoppingBag size={17} /> Shopping agent</button>
           <button type="button" aria-current={activeView === 'status' ? 'page' : undefined} className={activeView === 'status' ? 'nav-active' : ''} onClick={() => setActiveView('status')}><Shield size={17} /> System status</button>
         </nav>
@@ -80,6 +84,10 @@ function App() {
               <h2>Start a session to manage mandates</h2>
               <p>Mandates are scoped to your authenticated LEASH session.</p>
             </section>
+          )
+        ) : activeView === 'proposals' ? (
+          session.status === 'active' ? <ProposalInbox proposals={proposalState} /> : (
+            <section className="mandate-card session-required"><Shield size={24} /><h2>Start a session to review proposals</h2><p>Proposals are scoped to your authenticated LEASH session.</p></section>
           )
         ) : activeView === 'shopping' ? (
           <ShoppingAgent token={session.status === 'active' ? session.token : null}

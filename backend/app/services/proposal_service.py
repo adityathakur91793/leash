@@ -351,40 +351,12 @@ async def evaluate_proposal_service(
         return decision
 
     from app.services.intent_audit_service import assess_and_persist
-    from app.schemas.intent_audit import IntentRiskLevel
 
     from app.services.intent_audit_service import DeterministicBlockDetected
     try:
-        assessment = await assess_and_persist(
+        await assess_and_persist(
             proposal_id, decision, daily_limit=daily_limit, oracle_result=oracle_result
         )
     except DeterministicBlockDetected as exc:
         return exc.decision
-    if decision.decision == DecisionOutcome.ALLOW and assessment.risk_level == IntentRiskLevel.LOW:
-        async with get_connection() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            try:
-                current = await get_proposal(proposal_id, db=db)
-                mandate = await get_mandate(current.mandate_id, db=db)
-                from app.db.database import is_kill_switch_active
-                if await is_kill_switch_active(db=db):
-                    raise RuntimeError("Emergency kill switch is active; approval halted.")
-                from app.services.intent_audit_service import require_current_assessment
-                await require_current_assessment(
-                    current, mandate, db=db, daily_limit=daily_limit,
-                    oracle_result=oracle_result,
-                )
-                await set_proposal_status(proposal_id, ProposalStatus.APPROVED, db=db)
-                from app.services.audit_service import AuditService
-                await AuditService.append_event(
-                    event_type=AuditEventType.PROPOSAL_APPROVED,
-                    entity_type=AuditEntityType.PROPOSAL, entity_id=proposal_id,
-                    actor=AuditActor.POLICY_ENGINE,
-                    payload={"proposal_id": proposal_id, "decision": decision.decision.value,
-                             "intent_risk": assessment.risk_level.value}, db=db,
-                )
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
     return decision

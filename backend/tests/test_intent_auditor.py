@@ -183,8 +183,21 @@ async def _active_proposal(product_name: str = "Book"):
     return proposal, mandate
 
 
+async def _approve_explicitly(proposal_id: str, principal_id: str) -> None:
+    """Use the one-time token workflow after evaluation for payment-path tests."""
+    issued = await issue_approval_token(proposal_id, principal_id)
+    success, reason = await consume_approval_token(
+        proposal_id=proposal_id,
+        token=issued["token"],
+        principal_id=principal_id,
+        issued_at_iso=issued["issued_at"],
+        nonce=issued["nonce"],
+    )
+    assert success, reason
+
+
 @pytest.mark.parametrize("risk, expected", [
-    ("LOW", ProposalStatus.APPROVED), ("MEDIUM", ProposalStatus.EVALUATED),
+    ("LOW", ProposalStatus.EVALUATED), ("MEDIUM", ProposalStatus.EVALUATED),
     ("HIGH", ProposalStatus.EVALUATED), ("UNCERTAIN", ProposalStatus.EVALUATED),
 ])
 @pytest.mark.asyncio
@@ -203,6 +216,30 @@ async def test_risk_level_never_grants_authority(risk, expected, monkeypatch) ->
             from app.services.mandate_service import get_mandate
             mandate = await get_mandate(current.mandate_id)
             await require_current_assessment(current, mandate)
+
+
+@pytest.mark.asyncio
+async def test_review_evaluation_low_risk_never_approves_or_emits_approval(monkeypatch) -> None:
+    proposal, _ = await _active_proposal()
+
+    async def low_risk(self, payload):
+        return IntentAuditorResult(schema_version="1.0", risk_level="LOW")
+
+    monkeypatch.setattr(IntentAuditorClient, "assess", low_risk)
+    decision = await evaluate_proposal_service(proposal.proposal_id)
+    assert decision.decision.value == "ALLOW"
+    assert (await get_proposal(proposal.proposal_id)).status == ProposalStatus.EVALUATED
+    async with get_connection() as db:
+        approved_events = await (await db.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE event_type = 'PROPOSAL_APPROVED' "
+            "AND entity_id = ?", (proposal.proposal_id,),
+        )).fetchone()
+        tokens = await (await db.execute(
+            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ?",
+            (proposal.proposal_id,),
+        )).fetchone()
+    assert approved_events[0] == 0
+    assert tokens[0] == 0
 
 
 @pytest.mark.asyncio
@@ -341,6 +378,7 @@ class _PayPalOrderStub:
 async def test_stale_assessment_blocks_payment_order_creation() -> None:
     proposal, _ = await _active_proposal()
     await evaluate_proposal_service(proposal.proposal_id)
+    await _approve_explicitly(proposal.proposal_id, "owner-test")
     await _set_assessment_version(proposal.proposal_id, "schema_version", "0.9")
     paypal = _PayPalOrderStub()
     with pytest.raises(IntentAuditorUnavailable):
@@ -352,6 +390,7 @@ async def test_stale_assessment_blocks_payment_order_creation() -> None:
 async def test_stale_assessment_blocks_payment_capture() -> None:
     proposal, _ = await _active_proposal()
     await evaluate_proposal_service(proposal.proposal_id)
+    await _approve_explicitly(proposal.proposal_id, "owner-test")
     paypal = _PayPalOrderStub()
     await create_payment_order(proposal.proposal_id, "owner-test", paypal_client=paypal)
     await _set_assessment_version(proposal.proposal_id, "prompt_version", "old-prompt")

@@ -109,9 +109,9 @@ async def test_int_01_clean_evaluation_allows() -> None:
     assert decision.blocking_rules == []
     assert decision.approval_required_rules == []
 
-    # Proposal state is advanced to APPROVED
+    # Evaluation records policy and auditor findings without approving.
     updated = await get_proposal(proposal.proposal_id)
-    assert updated.status == ProposalStatus.APPROVED
+    assert updated.status == ProposalStatus.EVALUATED
 
 
 # --- INT-02: Clean evaluation with require_user_approval == True -> REQUIRE_APPROVAL ---
@@ -487,7 +487,7 @@ async def test_remediation_concurrent_evaluations_atomic_reservation() -> None:
     updated1 = await get_proposal(prop1.proposal_id)
     updated2 = await get_proposal(prop2.proposal_id)
     statuses = {updated1.status, updated2.status}
-    assert statuses == {ProposalStatus.APPROVED, ProposalStatus.REJECTED}
+    assert statuses == {ProposalStatus.EVALUATED, ProposalStatus.REJECTED}
 
 
 async def test_remediation_persistent_approval_token_single_use() -> None:

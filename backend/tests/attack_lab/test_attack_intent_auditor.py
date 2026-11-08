@@ -71,6 +71,27 @@ async def _forward_to_script(
     monkeypatch.setattr(IntentAuditorClient, "assess", assess_with_script)
 
 
+async def _approve_with_token(proposal_id: str, principal_id: str) -> None:
+    issued = await issue_approval_token(proposal_id, principal_id)
+    success, reason = await consume_approval_token(
+        proposal_id=proposal_id,
+        token=issued["token"],
+        principal_id=principal_id,
+        issued_at_iso=issued["issued_at"],
+        nonce=issued["nonce"],
+    )
+    assert success, reason
+
+
+async def _tamper_policy_evidence(proposal_id: str) -> None:
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE intent_assessments SET policy_snapshot_hash = ? WHERE proposal_id = ?",
+            ("0" * 64, proposal_id),
+        )
+        await db.commit()
+
+
 async def _automatic_case(
     owner_user_id: str,
     attack_factories: dict[str, Any],
@@ -318,17 +339,17 @@ async def test_stale_binding_blocks_payment_order_creation(
     await _forward_to_script(client, monkeypatch)
     await evaluate_proposal_service(
         proposal.proposal_id,
-        daily_limit=(Decimal("35.00") if binding == "policy_evidence" else None),
     )
-    assert (await get_proposal(proposal.proposal_id)).status.value == "APPROVED"
+    assert (await get_proposal(proposal.proposal_id)).status.value == "EVALUATED"
+    await _approve_with_token(proposal.proposal_id, attack_case.user_a.user_id)
 
     if binding == "proposal":
         await _tamper_proposal_content(proposal.proposal_id)
     elif binding == "mandate":
         await _tamper_mandate_permissions(mandate.mandate_id)
+    else:
+        await _tamper_policy_evidence(proposal.proposal_id)
 
-    with pytest.raises(IntentAuditorUnavailable):
-        await issue_approval_token(proposal.proposal_id, attack_case.user_a.user_id)
     paypal = _PayPalCallCounter()
     with pytest.raises(IntentAuditorUnavailable):
         await create_payment_order(
@@ -345,7 +366,7 @@ async def test_stale_binding_blocks_payment_order_creation(
         )
         assert (await cursor.fetchone())[0] == 0
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ?",
+            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ? AND consumed_at IS NULL",
             (proposal.proposal_id,),
         )
         assert (await cursor.fetchone())[0] == 0
@@ -478,17 +499,17 @@ async def test_stale_binding_blocks_payment_order_creation(
     await _forward_to_script(client, monkeypatch)
     await evaluate_proposal_service(
         proposal.proposal_id,
-        daily_limit=(Decimal("35.00") if binding == "policy_evidence" else None),
     )
-    assert (await get_proposal(proposal.proposal_id)).status.value == "APPROVED"
+    assert (await get_proposal(proposal.proposal_id)).status.value == "EVALUATED"
+    await _approve_with_token(proposal.proposal_id, attack_case.user_a.user_id)
 
     if binding == "proposal":
         await _tamper_proposal_content(proposal.proposal_id)
     elif binding == "mandate":
         await _tamper_mandate_permissions(mandate.mandate_id)
+    else:
+        await _tamper_policy_evidence(proposal.proposal_id)
 
-    with pytest.raises(IntentAuditorUnavailable):
-        await issue_approval_token(proposal.proposal_id, attack_case.user_a.user_id)
     paypal = _PayPalCallCounter()
     with pytest.raises(IntentAuditorUnavailable):
         await create_payment_order(
@@ -505,7 +526,7 @@ async def test_stale_binding_blocks_payment_order_creation(
         )
         assert (await cursor.fetchone())[0] == 0
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ?",
+            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ? AND consumed_at IS NULL",
             (proposal.proposal_id,),
         )
         assert (await cursor.fetchone())[0] == 0

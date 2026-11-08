@@ -13,6 +13,7 @@ from app.db.database import get_paypal_order_from_db
 from app.schemas.payment import PayPalOrderStatus
 from app.schemas.proposal import ProposalStatus
 from app.services.audit_service import AuditService
+from app.services.approval_service import consume_approval_token, issue_approval_token
 from app.services.paypal_service import PayPalCaptureError, PayPalNetworkError
 from app.services.payment_service import (
     capture_payment_order,
@@ -40,7 +41,16 @@ async def test_concurrent_capture_rereads_order_after_ambiguous_first_attempt(
     proposal = await attack_factories["proposal"](mandate.mandate_id)
     decision = await evaluate_proposal_service(proposal.proposal_id)
     assert decision.decision.value == "ALLOW"
-    assert (await get_proposal(proposal.proposal_id)).status == ProposalStatus.APPROVED
+    assert (await get_proposal(proposal.proposal_id)).status == ProposalStatus.EVALUATED
+    issued = await issue_approval_token(proposal.proposal_id, owner.user_id)
+    approved, _ = await consume_approval_token(
+        proposal_id=proposal.proposal_id,
+        token=issued["token"],
+        principal_id=owner.user_id,
+        issued_at_iso=issued["issued_at"],
+        nonce=issued["nonce"],
+    )
+    assert approved is True
 
     class OrderCreator:
         async def create_order(self, **kwargs: Any) -> dict[str, str]:

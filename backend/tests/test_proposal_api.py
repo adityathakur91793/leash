@@ -11,7 +11,7 @@ from app.db.database import get_db_path
 pytestmark = pytest.mark.asyncio
 
 
-def _mandate_api_payload() -> dict:
+def _mandate_api_payload(*, require_user_approval: bool = True) -> dict:
     return {
         "max_total_budget": "40.00",
         "currency": "USD",
@@ -21,7 +21,7 @@ def _mandate_api_payload() -> dict:
         "max_quantity_per_item": 1,
         "max_price_per_item": "25.00",
         "allow_subscriptions": False,
-        "require_user_approval": True,
+        "require_user_approval": require_user_approval,
         "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
     }
 
@@ -46,11 +46,17 @@ def _proposal_api_payload(mandate_id: str, **overrides: object) -> dict:
     return payload
 
 
-async def _create_mandate(client: httpx.AsyncClient) -> tuple[str, dict[str, str]]:
+async def _create_mandate(
+    client: httpx.AsyncClient, *, require_user_approval: bool = True
+) -> tuple[str, dict[str, str]]:
     session_res = await client.post("/api/v1/sessions", json={})
     token = session_res.json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
-    response = await client.post("/api/v1/mandates", json=_mandate_api_payload(), headers=headers)
+    response = await client.post(
+        "/api/v1/mandates",
+        json=_mandate_api_payload(require_user_approval=require_user_approval),
+        headers=headers,
+    )
     assert response.status_code == 201
     return response.json()["mandate_id"], headers
 
@@ -209,6 +215,50 @@ async def test_api_mandate_endpoints_still_work(client: httpx.AsyncClient) -> No
     assert verify.json()["valid"] is True
 
 
+@pytest.mark.parametrize("evaluation_path", ["evaluate-review", "evaluate"])
+async def test_evaluation_routes_never_approve_low_risk_proposals(
+    client: httpx.AsyncClient, evaluation_path: str
+) -> None:
+    """Both evaluation APIs persist review results without approval/payment effects."""
+    mandate_id, headers = await _create_mandate(client, require_user_approval=False)
+    for action in ("confirm", "sign", "activate"):
+        response = await client.post(
+            f"/api/v1/mandates/{mandate_id}/{action}", headers=headers
+        )
+        assert response.status_code == 200
+
+    created = await client.post(
+        "/api/v1/proposals", json=_proposal_api_payload(mandate_id), headers=headers
+    )
+    assert created.status_code == 201
+    proposal_id = created.json()["proposal_id"]
+
+    response = await client.post(
+        f"/api/v1/proposals/{proposal_id}/{evaluation_path}", headers=headers
+    )
+    assert response.status_code == 200
+    assert response.json()["decision"] == "ALLOW"
+
+    async with aiosqlite.connect(get_db_path()) as db:
+        status_row = await (await db.execute(
+            "SELECT status FROM proposals WHERE proposal_id = ?", (proposal_id,)
+        )).fetchone()
+        approved_events = await (await db.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE event_type = 'PROPOSAL_APPROVED' "
+            "AND entity_id = ?", (proposal_id,),
+        )).fetchone()
+        token_rows = await (await db.execute(
+            "SELECT COUNT(*) FROM approval_tokens WHERE proposal_id = ?", (proposal_id,)
+        )).fetchone()
+        payment_rows = await (await db.execute(
+            "SELECT COUNT(*) FROM paypal_orders WHERE proposal_id = ?", (proposal_id,)
+        )).fetchone()
+    assert status_row[0] == "EVALUATED"
+    assert approved_events[0] == 0
+    assert token_rows[0] == 0
+    assert payment_rows[0] == 0
+
+
 async def test_proposal_api_requires_auth_for_create_list_retrieve_and_evaluate(
     client: httpx.AsyncClient,
 ) -> None:
@@ -271,6 +321,14 @@ async def test_proposal_api_enforces_owner_scope_and_mandate_association(
     )
     assert foreign_evaluate.status_code == missing_evaluate.status_code == 404
     assert foreign_evaluate.json()["detail"] == missing_evaluate.json()["detail"]
+    foreign_review = await client.post(
+        f"/api/v1/proposals/{proposal_id}/evaluate-review", headers=headers_b
+    )
+    missing_review = await client.post(
+        "/api/v1/proposals/prp_nonexistent/evaluate-review", headers=headers_b
+    )
+    assert foreign_review.status_code == missing_review.status_code == 404
+    assert foreign_review.json()["detail"] == missing_review.json()["detail"]
 
     foreign_filter = await client.get(
         f"/api/v1/proposals?mandate_id={mandate_a}", headers=headers_b
