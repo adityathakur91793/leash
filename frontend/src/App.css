@@ -722,3 +722,109 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .form-actions { flex-wrap: wrap; }
   .form-actions > button { flex: 1; }
 }
+
+.intent-assessment-card {
+  display: grid;
+  gap: 0.9rem;
+  min-width: 0;
+  margin-top: 1.2rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(43, 27, 76, 0.04);
+}
+.intent-assessment-header, .intent-assessment-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.intent-assessment-header { justify-content: space-between; }
+.intent-assessment-heading { min-width: 0; }
+.intent-assessment-heading h3 { margin-top: 0.15rem; color: var(--navy); font-size: 1.05rem; }
+.intent-assessment-icon {
+  display: grid;
+  flex: 0 0 40px;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--lavender);
+  color: var(--violet);
+}
+.intent-assessment-refresh { flex-shrink: 0; }
+.intent-assessment-advisory, .intent-assessment-timestamp {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.intent-assessment-policy-note {
+  padding: 0.7rem 0.8rem;
+  border: 1px solid #ead7a5;
+  border-radius: 10px;
+  background: #fffaf0;
+  color: #674b14;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.intent-assessment-message {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+.intent-assessment-error-state { display: grid; justify-items: start; gap: 0.65rem; }
+.intent-assessment-error { color: #9f3347; }
+.intent-assessment-empty { display: grid; gap: 0.3rem; color: var(--muted); font-size: 0.86rem; line-height: 1.5; }
+.intent-assessment-badges { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.intent-assessment-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 29px;
+  padding: 0.32rem 0.58rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.intent-risk-low, .intent-status-valid, .intent-current { border-color: #b8e3cf; background: #f1faf5; color: #116643; }
+.intent-risk-medium { border-color: #ead7a5; background: #fffaf0; color: #674b14; }
+.intent-risk-high, .intent-status-failed { border-color: #f0c4cb; background: #fff5f6; color: #942d41; }
+.intent-risk-uncertain, .intent-status-stale, .intent-not-current { border-color: #d9d0e9; background: #f6f3fb; color: #514078; }
+.intent-assessment-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; }
+.intent-assessment-sections section { min-width: 0; }
+.intent-assessment-sections h4 { margin-bottom: 0.5rem; color: var(--navy); font-size: 0.82rem; }
+.intent-assessment-list, .intent-assessment-fields { display: grid; gap: 0.4rem; padding: 0; list-style: none; }
+.intent-assessment-list li, .intent-assessment-fields li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+  min-width: 0;
+  padding: 0.6rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fcfbfe;
+  color: #403652;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+.intent-assessment-list li code, .intent-assessment-fields li code {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.intent-assessment-empty-list { color: var(--muted); font-size: 0.8rem; line-height: 1.45; }
+@media (max-width: 600px) {
+  .intent-assessment-header { align-items: flex-start; flex-wrap: wrap; }
+  .intent-assessment-refresh { width: 100%; }
+  .intent-assessment-sections { grid-template-columns: 1fr; }
+  .intent-assessment-list li, .intent-assessment-fields li { flex-direction: column; gap: 0.2rem; }
+  .intent-assessment-list li code, .intent-assessment-fields li code { text-align: left; }
+}

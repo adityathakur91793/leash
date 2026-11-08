@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../services/api';
 import {
@@ -8,6 +8,7 @@ import {
 } from '../services/proposals';
 import { useIntentAssessment } from '../hooks/useIntentAssessment';
 import { useProposals } from '../hooks/useProposals';
+import { ProposalInbox } from '../components/ProposalInbox';
 import * as proposalApi from '../services/proposals';
 
 const currentAssessment = {
@@ -343,6 +344,51 @@ describe('useIntentAssessment', () => {
     await act(async () => { await hook.result.current.proposals.evaluate(); });
     await waitFor(() => expect(getAssessment).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(hook.result.current.assessment.assessment).toEqual(currentAssessment));
+  });
+
+  it('keeps the rendered assessment attached to the selected proposal during A-to-B races', async () => {
+    const requestA = deferred();
+    const listRequest = deferred();
+    const proposalB = { ...proposal, proposal_id: 'pr_2', product_name: 'Second proposal' };
+    const assessmentB = {
+      ...currentAssessment,
+      risk_level: 'HIGH',
+      finding_codes: ['MERCHANT_MISMATCH'],
+      affected_fields: ['merchant'],
+    };
+    const listProposals = vi.spyOn(proposalApi, 'listProposals').mockReturnValue(listRequest.promise);
+    vi.spyOn(proposalApi, 'getProposal').mockImplementation((_, id) => (
+      Promise.resolve(id === 'pr_1' ? proposal : proposalB)
+    ));
+    const getAssessment = vi.spyOn(proposalApi, 'getIntentAssessment').mockImplementation((_, id) => (
+      id === 'pr_1' ? requestA.promise : Promise.resolve(assessmentB)
+    ));
+
+    function ReviewHarness() {
+      const proposals = useProposals('session-token', vi.fn());
+      const assessment = useIntentAssessment(
+        'session-token', vi.fn(), proposals.selectedId, proposals.evaluationRevision,
+      );
+      return <ProposalInbox proposals={{ ...proposals, intentAssessment: assessment }} />;
+    }
+
+    render(<ReviewHarness />);
+    await waitFor(() => expect(listProposals).toHaveBeenCalledTimes(1));
+    await act(async () => listRequest.resolve([proposal, proposalB]));
+    fireEvent.click(screen.getByRole('button', { name: /Notebook/ }));
+    await screen.findByRole('heading', { name: 'Notebook' });
+    await waitFor(() => expect(getAssessment).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: /Second proposal/ }));
+    await screen.findByRole('heading', { name: 'Second proposal' });
+    expect(await screen.findByText('Risk level: High')).toBeInTheDocument();
+    expect(screen.getByText('MERCHANT_MISMATCH')).toBeInTheDocument();
+    expect(screen.queryByText('BUDGET_TENSION')).not.toBeInTheDocument();
+
+    await act(async () => requestA.resolve(currentAssessment));
+    expect(screen.getByRole('heading', { name: 'Second proposal' })).toBeInTheDocument();
+    expect(screen.getByText('MERCHANT_MISMATCH')).toBeInTheDocument();
+    expect(screen.queryByText('BUDGET_TENSION')).not.toBeInTheDocument();
+    expect(getAssessment).toHaveBeenCalledTimes(2);
   });
 
   it('ignores the first StrictMode effect lifecycle response', async () => {
