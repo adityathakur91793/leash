@@ -55,6 +55,7 @@ async def test_ambiguous_capture_is_reconciled_without_blind_retry(monkeypatch) 
     from app.services import payment_service as service
     from app.services import intent_audit_service
     monkeypatch.setattr(intent_audit_service, "require_current_assessment", _async_value({"status": "VALID", "risk_level": "LOW"}))
+    monkeypatch.setattr(service, "require_current_purchase_consent", _async_value(None))
 
     now = datetime.now(timezone.utc)
     order = SimpleNamespace(
@@ -216,6 +217,7 @@ async def test_ambiguous_capture_reconciles_only_verified_completed_evidence(
         "require_current_assessment",
         _async_value({"status": "VALID", "risk_level": "LOW"}),
     )
+    monkeypatch.setattr(service, "require_current_purchase_consent", _async_value(None))
     monkeypatch.setattr(service, "is_kill_switch_active", _async_value(False))
     monkeypatch.setattr(service, "get_paypal_order_from_db", _async_value(order))
     monkeypatch.setattr(service, "get_proposal_from_db", _async_value(proposal))
@@ -290,6 +292,7 @@ async def test_capture_finalization_stops_if_order_update_loses_race(monkeypatch
     from app.services import payment_service as service
     from app.services import intent_audit_service
     monkeypatch.setattr(intent_audit_service, "require_current_assessment", _async_value({"status": "VALID", "risk_level": "LOW"}))
+    monkeypatch.setattr(service, "require_current_purchase_consent", _async_value(None))
 
     now = datetime.now(timezone.utc)
     order = SimpleNamespace(

@@ -157,7 +157,7 @@ async def test_multiple_sessions_same_principal(client: httpx.AsyncClient) -> No
 
 
 async def test_cross_principal_issue_token_rejected(client: httpx.AsyncClient) -> None:
-    """Principal B cannot issue an approval token for Principal A's mandate (403 Forbidden)."""
+    """Foreign proposal issuance is indistinguishable from missing (404)."""
     headers_a, principal_a = await _create_user_session(client)
     headers_b, principal_b = await _create_user_session(client)
     assert principal_a != principal_b
@@ -169,12 +169,12 @@ async def test_cross_principal_issue_token_rejected(client: httpx.AsyncClient) -
         json={"proposal_id": prop_id},
         headers=headers_b,
     )
-    assert res.status_code == 403
-    assert "Forbidden" in res.json()["detail"]
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Proposal not found."
 
 
 async def test_cross_principal_consume_token_rejected(client: httpx.AsyncClient) -> None:
-    """Principal B cannot consume an approval token for Principal A's mandate (403 Forbidden)."""
+    """Foreign proposal consumption is indistinguishable from missing (404)."""
     headers_a, principal_a = await _create_user_session(client)
     headers_b, principal_b = await _create_user_session(client)
     assert principal_a != principal_b
@@ -201,8 +201,8 @@ async def test_cross_principal_consume_token_rejected(client: httpx.AsyncClient)
         },
         headers=headers_b,
     )
-    assert consume_res.status_code == 403
-    assert "Forbidden" in consume_res.json()["detail"]
+    assert consume_res.status_code == 404
+    assert consume_res.json()["detail"] == "Proposal not found."
 
 
 async def test_ownerless_legacy_mandate_fails_closed(client: httpx.AsyncClient) -> None:
@@ -223,8 +223,8 @@ async def test_ownerless_legacy_mandate_fails_closed(client: httpx.AsyncClient) 
         json={"proposal_id": prop_id},
         headers=headers,
     )
-    assert res.status_code == 403
-    assert "Ownerless mandate" in res.json()["detail"]
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Proposal not found."
 
 
 async def test_client_cannot_forge_ownership_field(client: httpx.AsyncClient) -> None:

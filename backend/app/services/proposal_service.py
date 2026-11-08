@@ -212,6 +212,10 @@ async def set_proposal_status(
     This records evaluation outcome only. It does not authorize payment
     execution and does not mutate locked proposal fields.
     """
+    if new_status == ProposalStatus.APPROVED:
+        raise InvalidProposalStatusTransitionError(
+            "APPROVED can only be set by the durable purchase-consent service."
+        )
     proposal = await get_proposal(proposal_id, db=db)
     allowed = ALLOWED_STATUS_TRANSITIONS.get(proposal.status, set())
     if new_status not in allowed:

@@ -1187,6 +1187,7 @@ def canonicalize_approval_payload(
     approval_timestamp: datetime,
     expires_at: datetime,
     nonce: str,
+    assessment_binding: str | None = None,
 ) -> str:
     """Serialize approval token parameters into deterministic canonical JSON.
 
@@ -1215,6 +1216,11 @@ def canonicalize_approval_payload(
         "proposal_id": proposal_id.strip(),
         "user_session_id": user_session_id.strip(),
     }
+    if assessment_binding is not None:
+        if (not isinstance(assessment_binding, str) or len(assessment_binding) != 64
+                or any(char not in "0123456789abcdef" for char in assessment_binding)):
+            raise ValueError("assessment_binding must be a SHA-256 hex digest.")
+        envelope["assessment_binding"] = assessment_binding
     return json.dumps(
         envelope,
         sort_keys=True,
@@ -1232,6 +1238,7 @@ def generate_approval_token(
     expires_at: datetime | None = None,
     secret_key: str | None = None,
     ttl_seconds: int = 900,
+    assessment_binding: str | None = None,
 ) -> str:
     """Generate cryptographically bound single-use user approval token.
 
@@ -1250,6 +1257,7 @@ def generate_approval_token(
         approval_timestamp=approval_timestamp,
         expires_at=expires_at,
         nonce=nonce,
+        assessment_binding=assessment_binding,
     )
     return hmac.new(key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -1265,6 +1273,7 @@ def verify_approval_token(
     expires_at: datetime | None = None,
     ttl_seconds: int = 900,
     secret_key: str | None = None,
+    assessment_binding: str | None = None,
 ) -> tuple[bool, str]:
     """Verify approval token is cryptographically valid, not expired, and correctly bound."""
     if not token or not isinstance(token, str):
@@ -1300,6 +1309,7 @@ def verify_approval_token(
             expires_at=expires_at,
             secret_key=key,
             ttl_seconds=ttl_seconds,
+            assessment_binding=assessment_binding,
         )
     except ValueError as exc:
         return False, f"Token generation validation error: {exc}"
@@ -1313,11 +1323,17 @@ def verify_approval_token(
 async def register_approval_token(
     token: str,
     proposal_id: str,
+    owner_user_id: str,
+    content_hash: str,
+    assessment_binding: str,
     approval_timestamp: datetime,
     ttl_seconds: int = 900,
     db: aiosqlite.Connection | None = None,
 ) -> None:
     """Pre-register an issued approval token's hash in database for single-use tracking."""
+    if (not isinstance(assessment_binding, str) or len(assessment_binding) != 64
+            or any(char not in "0123456789abcdef" for char in assessment_binding)):
+        raise ValueError("A canonical auditor assessment binding is required.")
     token_hash = hash_approval_token(token)
     expires_at = approval_timestamp.astimezone(timezone.utc) + timedelta(seconds=ttl_seconds)
     created_at_iso = approval_timestamp.astimezone(timezone.utc).isoformat()
@@ -1325,6 +1341,9 @@ async def register_approval_token(
     await record_approval_token_in_db(
         token_hash=token_hash,
         proposal_id=proposal_id,
+        owner_user_id=owner_user_id,
+        content_hash=content_hash,
+        assessment_binding=assessment_binding,
         expires_at_iso=expires_at_iso,
         created_at_iso=created_at_iso,
         db=db,
@@ -1338,6 +1357,7 @@ async def verify_and_consume_approval_token(
     user_session_id: str,
     approval_timestamp: datetime,
     nonce: str,
+    assessment_binding: str,
     now: datetime,
     expires_at: datetime | None = None,
     ttl_seconds: int = 900,
@@ -1353,6 +1373,9 @@ async def verify_and_consume_approval_token(
     4. Expiry check against TTL and UTC issuance timestamp.
     5. Atomic single-use consumption in SQLite (prevents concurrent replay).
     """
+    if (not isinstance(assessment_binding, str) or len(assessment_binding) != 64
+            or any(char not in "0123456789abcdef" for char in assessment_binding)):
+        return False, "A canonical auditor assessment binding is required."
     is_valid, reason = verify_approval_token(
         token=token,
         proposal_id=proposal_id,
@@ -1364,6 +1387,7 @@ async def verify_and_consume_approval_token(
         expires_at=expires_at,
         ttl_seconds=ttl_seconds,
         secret_key=secret_key,
+        assessment_binding=assessment_binding,
     )
     if not is_valid:
         return False, reason
@@ -1373,6 +1397,9 @@ async def verify_and_consume_approval_token(
     return await consume_approval_token_in_db(
         token_hash=token_hash,
         proposal_id=proposal_id,
+        owner_user_id=user_session_id,
+        content_hash=content_hash,
+        assessment_binding=assessment_binding,
         consumed_at_iso=consumed_at_iso,
         db=db,
     )

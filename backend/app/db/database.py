@@ -62,8 +62,11 @@ async def get_connection(url: str | None = None) -> AsyncIterator[aiosqlite.Conn
         yield db
 
 
-async def init_db() -> None:
+async def init_db(*, _target_version: int | None = None) -> None:
     """Create database tables and apply incremental schema migrations."""
+    target_version = 10 if _target_version is None else _target_version
+    if not 1 <= target_version <= 10:
+        raise ValueError("Database migration target must be between versions 1 and 10.")
     db_path: str = get_db_path()
 
     if db_path != ":memory:":
@@ -86,7 +89,7 @@ async def init_db() -> None:
         current_version = row[0] if row and row[0] is not None else 0
 
         # Migration 1: Initial bootstrap
-        if current_version < 1:
+        if current_version < 1 and target_version >= 1:
             await db.execute(
                 "INSERT INTO schema_version (version, applied_at) "
                 "VALUES (1, datetime('now'))"
@@ -95,7 +98,7 @@ async def init_db() -> None:
             logger.info("Applied migration version 1")
 
         # Migration 2: Mandates table (Phase 2A)
-        if current_version < 2:
+        if current_version < 2 and target_version >= 2:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mandates (
@@ -127,7 +130,7 @@ async def init_db() -> None:
             logger.info("Applied migration version 2 (mandates)")
 
         # Migration 3: Purchase proposals (Phase 2B)
-        if current_version < 3:
+        if current_version < 3 and target_version >= 3:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS proposals (
@@ -177,7 +180,7 @@ async def init_db() -> None:
             logger.info("Applied migration version 3 (proposals)")
 
         # Migration 4: Approval tokens tracking (Phase 2C Remediation)
-        if current_version < 4:
+        if current_version < 4 and target_version >= 4:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS approval_tokens (
@@ -202,7 +205,7 @@ async def init_db() -> None:
             logger.info("Applied migration version 4 (approval_tokens)")
 
         # Migration 5: Audit logs, checkpoints, and system controls (Phase 2D.1)
-        if current_version < 5:
+        if current_version < 5 and target_version >= 5:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -389,7 +392,7 @@ async def init_db() -> None:
                 )
 
         # Migration 6: User sessions and mandate ownership
-        if current_version < 6:
+        if current_version < 6 and target_version >= 6:
             # user_sessions table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS user_sessions (
@@ -418,7 +421,7 @@ async def init_db() -> None:
             )
 
         # Migration 7: PayPal Orders and Payment Execution (Phase 3)
-        if current_version < 7:
+        if current_version < 7 and target_version >= 7:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS paypal_orders (
                     order_id            TEXT PRIMARY KEY,
@@ -466,7 +469,7 @@ async def init_db() -> None:
             logger.info("Applied migration version 7 (paypal_orders)")
 
         # Migration 8: content-bound Intent Auditor assessments (Phase 5).
-        if current_version < 8:
+        if current_version < 8 and target_version >= 8:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS intent_assessments (
                     assessment_id TEXT PRIMARY KEY,
@@ -498,6 +501,71 @@ async def init_db() -> None:
             )
             current_version = 8
             logger.info("Applied migration version 8 (intent_assessments)")
+
+        # Migration 9: durable, content-bound purchase consent (Phase 7F.2A).
+        if current_version < 9 and target_version >= 9:
+            # Historical token rows cannot serve as review evidence for the new
+            # consent contract because their owner/content bindings were not stored.
+            await db.execute("ALTER TABLE approval_tokens ADD COLUMN owner_user_id TEXT")
+            await db.execute("ALTER TABLE approval_tokens ADD COLUMN content_hash TEXT")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_tokens_review_binding "
+                "ON approval_tokens(proposal_id, owner_user_id, content_hash, consumed_at)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS purchase_consents (
+                    consent_id                 TEXT PRIMARY KEY,
+                    proposal_id                TEXT NOT NULL,
+                    owner_user_id              TEXT NOT NULL,
+                    mandate_id                  TEXT NOT NULL,
+                    proposal_content_hash      TEXT NOT NULL,
+                    mandate_permissions_hash   TEXT NOT NULL,
+                    policy_snapshot_hash       TEXT NOT NULL,
+                    policy_version             TEXT NOT NULL,
+                    policy_decision            TEXT NOT NULL
+                        CHECK (policy_decision IN ('ALLOW', 'REQUIRE_APPROVAL')),
+                    amount                     TEXT NOT NULL,
+                    currency                   TEXT NOT NULL CHECK (length(currency) = 3),
+                    review_token_hash          TEXT,
+                    binding_hash               TEXT NOT NULL,
+                    consented_at               TEXT NOT NULL,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id),
+                    FOREIGN KEY (mandate_id) REFERENCES mandates(mandate_id),
+                    FOREIGN KEY (review_token_hash) REFERENCES approval_tokens(token_hash),
+                    UNIQUE (proposal_id, binding_hash)
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_purchase_consents_owner_proposal "
+                "ON purchase_consents(owner_user_id, proposal_id, consented_at)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (9, datetime('now'))"
+            )
+            current_version = 9
+            logger.info("Applied migration version 9 (purchase_consents)")
+
+        # Migration 10: bind review tokens and purchase consent to exact auditor evidence.
+        if current_version < 10 and target_version >= 10:
+            await db.execute(
+                "ALTER TABLE approval_tokens ADD COLUMN assessment_binding TEXT"
+            )
+            await db.execute(
+                "ALTER TABLE purchase_consents ADD COLUMN assessment_binding TEXT"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_tokens_assessment_review "
+                "ON approval_tokens(proposal_id, assessment_binding, consumed_at)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (10, datetime('now'))"
+            )
+            current_version = 10
+            logger.info("Applied migration version 10 (auditor-bound purchase consent)")
 
         await db.commit()
 
@@ -945,6 +1013,9 @@ def hash_approval_token(token: str) -> str:
 async def record_approval_token_in_db(
     token_hash: str,
     proposal_id: str,
+    owner_user_id: str,
+    content_hash: str,
+    assessment_binding: str,
     expires_at_iso: str,
     created_at_iso: str,
     db: aiosqlite.Connection | None = None,
@@ -952,10 +1023,12 @@ async def record_approval_token_in_db(
     """Persist an issued approval token hash and metadata before use."""
     query = """
         INSERT INTO approval_tokens (
-            token_hash, proposal_id, expires_at, created_at, consumed_at
-        ) VALUES (?, ?, ?, ?, NULL)
+            token_hash, proposal_id, owner_user_id, content_hash, assessment_binding,
+            expires_at, created_at, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
     """
-    params = (token_hash, proposal_id, expires_at_iso, created_at_iso)
+    params = (token_hash, proposal_id, owner_user_id, content_hash,
+              assessment_binding, expires_at_iso, created_at_iso)
     if db is not None:
         await db.execute(query, params)
         return
@@ -968,6 +1041,9 @@ async def record_approval_token_in_db(
 async def consume_approval_token_in_db(
     token_hash: str,
     proposal_id: str,
+    owner_user_id: str,
+    content_hash: str,
+    assessment_binding: str,
     consumed_at_iso: str,
     db: aiosqlite.Connection | None = None,
 ) -> tuple[bool, str]:
@@ -996,12 +1072,17 @@ async def consume_approval_token_in_db(
                 await conn.execute(
                     """
                     INSERT INTO approval_tokens (
-                        token_hash, proposal_id, expires_at, created_at, consumed_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        token_hash, proposal_id, owner_user_id, content_hash,
+                        assessment_binding,
+                        expires_at, created_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         token_hash,
                         proposal_id,
+                        owner_user_id,
+                        content_hash,
+                        assessment_binding,
                         consumed_at_iso,
                         consumed_at_iso,
                         consumed_at_iso,
@@ -1023,6 +1104,32 @@ async def consume_approval_token_in_db(
 
         if row["expires_at"] < consumed_at_iso:
             return False, f"Approval token expired at {row['expires_at']}."
+
+        # An unbound legacy row is updated only after the caller verifies the HMAC
+        # against the exact current assessment and owner/content values. Persist
+        # all bindings in the same atomic update that marks the token consumed.
+        if row["assessment_binding"] is None:
+            if (row["owner_user_id"] is not None and row["owner_user_id"] != owner_user_id) or (
+                row["content_hash"] is not None and row["content_hash"] != content_hash
+            ):
+                return False, "Approval token review binding does not match current authorization."
+            cursor = await conn.execute(
+                """
+                UPDATE approval_tokens
+                SET owner_user_id = ?, content_hash = ?, assessment_binding = ?, consumed_at = ?
+                WHERE token_hash = ? AND consumed_at IS NULL
+                  AND assessment_binding IS NULL
+                """,
+                (owner_user_id, content_hash, assessment_binding, consumed_at_iso, token_hash),
+            )
+            if cursor.rowcount == 1:
+                return True, "Approval token consumed successfully."
+            return False, "Approval token was changed concurrently; retry review."
+
+        if (row["owner_user_id"] != owner_user_id
+                or row["content_hash"] != content_hash
+                or row["assessment_binding"] != assessment_binding):
+            return False, "Approval token review binding does not match current authorization."
 
         cursor = await conn.execute(
             """

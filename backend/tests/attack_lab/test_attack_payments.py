@@ -19,6 +19,7 @@ from app.services.payment_service import (
     capture_payment_order,
     create_payment_order,
 )
+from app.services.purchase_consent_service import record_purchase_consent
 from app.services.proposal_service import evaluate_proposal_service, get_proposal
 from tests.attack_lab.support import AttackPrincipal
 
@@ -36,11 +37,11 @@ async def test_concurrent_capture_rereads_order_after_ambiguous_first_attempt(
 
     owner = attack_users[0]
     mandate = await attack_factories["mandate"](
-        owner.user_id, require_user_approval=False
+        owner.user_id, require_user_approval=True
     )
     proposal = await attack_factories["proposal"](mandate.mandate_id)
     decision = await evaluate_proposal_service(proposal.proposal_id)
-    assert decision.decision.value == "ALLOW"
+    assert decision.decision.value == "REQUIRE_APPROVAL"
     assert (await get_proposal(proposal.proposal_id)).status == ProposalStatus.EVALUATED
     issued = await issue_approval_token(proposal.proposal_id, owner.user_id)
     approved, _ = await consume_approval_token(
@@ -51,6 +52,7 @@ async def test_concurrent_capture_rereads_order_after_ambiguous_first_attempt(
         nonce=issued["nonce"],
     )
     assert approved is True
+    await record_purchase_consent(proposal.proposal_id, owner.user_id)
 
     class OrderCreator:
         async def create_order(self, **kwargs: Any) -> dict[str, str]:

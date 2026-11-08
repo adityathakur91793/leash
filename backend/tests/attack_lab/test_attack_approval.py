@@ -8,7 +8,6 @@ import httpx
 import pytest
 
 from app.db.database import get_connection
-from app.schemas.payment import PayPalOrderStatus
 from app.schemas.proposal import ProposalStatus
 from app.services.approval_service import (
     consume_approval_token,
@@ -100,16 +99,30 @@ async def test_auditor_risk_never_approves_without_explicit_token(
             paypal_client=paypal,  # type: ignore[arg-type]
         )
     assert paypal.create_calls == 0
+    with pytest.raises(ValueError, match="only valid for REQUIRE_APPROVAL"):
+        await issue_approval_token(proposal.proposal_id, attack_case.user_a.user_id)
+    assert (await get_proposal(proposal.proposal_id)).status == ProposalStatus.EVALUATED
+    assert paypal.create_calls == 0
+    assert (await verify_attack_audit_chain()).valid is True
 
-    issued = await issue_approval_token(
-        proposal.proposal_id, attack_case.user_a.user_id
-    )
+
+@pytest.mark.asyncio
+async def test_require_approval_token_is_single_use_under_concurrency(
+    attack_case: AttackCase,
+    attack_barrier: type[AsyncBarrier],
+    verify_attack_audit_chain: Any,
+) -> None:
+    """Exactly one consumer records exception review, not purchase consent."""
+    proposal_id = attack_case.proposal_a.proposal_id
+    decision = await evaluate_proposal_service(proposal_id)
+    assert decision.decision.value == "REQUIRE_APPROVAL"
+    issued = await issue_approval_token(proposal_id, attack_case.user_a.user_id)
     rendezvous = attack_barrier(2)
 
     async def consume_once() -> tuple[bool, str]:
         await rendezvous.wait()
         return await consume_approval_token(
-            proposal_id=proposal.proposal_id,
+            proposal_id=proposal_id,
             token=issued["token"],
             principal_id=attack_case.user_a.user_id,
             issued_at_iso=issued["issued_at"],
@@ -118,15 +131,7 @@ async def test_auditor_risk_never_approves_without_explicit_token(
 
     results = await asyncio.gather(consume_once(), consume_once())
     assert sum(success for success, _ in results) == 1
-    approved_proposal = await get_proposal(proposal.proposal_id)
-    assert approved_proposal.status == ProposalStatus.APPROVED
-    order = await create_payment_order(
-        proposal.proposal_id,
-        attack_case.user_a.user_id,
-        paypal_client=paypal,  # type: ignore[arg-type]
-    )
-    assert order.status == PayPalOrderStatus.CREATED
-    assert paypal.create_calls == 1
+    assert (await get_proposal(proposal_id)).status == ProposalStatus.EVALUATED
     assert (await verify_attack_audit_chain()).valid is True
 
 
@@ -148,7 +153,7 @@ async def test_mandate_revocation_between_token_issue_and_use_fails_closed(
     )
 
     assert success is False
-    assert "assessment" in reason.lower()
+    assert "BLOCK" in reason
     assert (await get_proposal(proposal_id)).status == ProposalStatus.EVALUATED
     async with get_connection() as db:
         cursor = await db.execute(

@@ -14,6 +14,8 @@ from app.schemas.approval import (
     ApprovalConsumeResponse,
     ApprovalTokenRequest,
     ApprovalTokenResponse,
+    PurchaseConsentRequest,
+    PurchaseConsentResponse,
 )
 from app.schemas.session import UserSession
 from app.services.approval_service import (
@@ -23,8 +25,16 @@ from app.services.approval_service import (
     issue_approval_token,
 )
 from app.services.mandate_service import MandateNotFoundError
-from app.services.proposal_service import ProposalNotFoundError, ProposalTamperedError
+from app.services.proposal_service import (
+    ProposalNotFoundError,
+    ProposalTamperedError,
+    get_proposal_for_owner,
+)
 from app.services.intent_auditor_client import IntentAuditorUnavailable
+from app.services.purchase_consent_service import (
+    PurchaseConsentDeniedError,
+    record_purchase_consent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +63,7 @@ async def issue_approval_token_endpoint(
             detail="proposal_id in body must match path parameter.",
         )
     try:
+        await get_proposal_for_owner(proposal_id, session.user_id)
         result = await issue_approval_token(
             proposal_id=proposal_id,
             principal_id=session.user_id,
@@ -81,11 +92,11 @@ async def issue_approval_token_endpoint(
     except IntentAuditorUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="A current valid intent assessment is required.") from exc
-    except (OwnerlessMandateError, MandateOwnershipError) as exc:
+    except (OwnerlessMandateError, MandateOwnershipError):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(exc),
-        ) from exc
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proposal not found.",
+        ) from None
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -105,11 +116,12 @@ async def consume_approval_token_endpoint(
     body: ApprovalConsumeRequest,
     session: UserSession = Depends(get_current_session),
 ) -> ApprovalConsumeResponse:
-    """Consume a one-time approval token to authorize a proposal.
+    """Consume a one-time token to complete REQUIRE_APPROVAL exception review.
 
     Verifies HMAC signature, checks expiry, and atomically marks token as used
     to prevent replay attacks. Kill switch must be inactive.
-    The authenticated principal must own the mandate the proposal belongs to.
+    This does not record purchase consent or authorize payment. The authenticated
+    principal must own the mandate the proposal belongs to.
     """
     if body.proposal_id != proposal_id:
         raise HTTPException(
@@ -117,6 +129,7 @@ async def consume_approval_token_endpoint(
             detail="proposal_id in body must match path parameter.",
         )
     try:
+        await get_proposal_for_owner(proposal_id, session.user_id)
         success, reason = await consume_approval_token(
             proposal_id=proposal_id,
             token=body.token,
@@ -134,17 +147,27 @@ async def consume_approval_token_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+    except ProposalTamperedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     except RuntimeError as exc:
         # Kill switch active or state unavailable
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
-    except (OwnerlessMandateError, MandateOwnershipError) as exc:
+    except IntentAuditorUnavailable as exc:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(exc),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A current valid intent assessment is required.",
         ) from exc
+    except (OwnerlessMandateError, MandateOwnershipError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proposal not found.",
+        ) from None
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -162,3 +185,49 @@ async def consume_approval_token_endpoint(
         reason=reason,
         proposal_id=proposal_id,
     )
+
+
+@router.post(
+    "/{proposal_id}/purchase-consent",
+    response_model=PurchaseConsentResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def record_purchase_consent_endpoint(
+    proposal_id: str,
+    body: PurchaseConsentRequest,
+    session: UserSession = Depends(get_current_session),
+) -> PurchaseConsentResponse:
+    """Record separate explicit purchase consent after current server checks."""
+    if body.confirm_purchase is not True:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Explicit purchase confirmation is required.",
+        )
+    try:
+        return await record_purchase_consent(proposal_id, session.user_id)
+    except ProposalNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except MandateNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ProposalTamperedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except IntentAuditorUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A current valid intent assessment is required.",
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Purchase consent is temporarily unavailable.",
+        ) from exc
+    except (OwnerlessMandateError, MandateOwnershipError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Proposal not found."
+        ) from None
+    except PurchaseConsentDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc

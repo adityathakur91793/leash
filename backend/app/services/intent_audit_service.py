@@ -24,11 +24,13 @@ from app.db.database import (
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.intent_audit import (
+    IntentAffectedField,
     IntentAssessmentRecord,
     IntentAssessmentStatus,
     IntentAuditorInput,
     IntentAuditorPolicyRule,
     IntentAuditorResult,
+    IntentFindingCode,
     IntentMandateSummary,
     IntentProposalSummary,
     IntentRiskLevel,
@@ -355,18 +357,22 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
     """Fail closed unless the latest valid assessment binds current deterministic state."""
     async def check(conn: aiosqlite.Connection) -> dict:
         cursor = await conn.execute(
-            "SELECT status, risk_level, proposal_content_hash, mandate_permissions_hash, "
-            "policy_snapshot_hash, schema_version, prompt_version, model_identifier "
+            "SELECT assessment_id, proposal_id, mandate_id, status, risk_level, "
+            "finding_codes_json, affected_fields_json, proposal_content_hash, "
+            "mandate_permissions_hash, policy_snapshot_hash, policy_version, "
+            "schema_version, prompt_version, model_identifier, created_at, failure_code "
             "FROM intent_assessments WHERE proposal_id = ? "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1", (proposal.proposal_id,)
         )
         row = await cursor.fetchone()
-        if row is None or row[0] != "VALID":
+        if row is None or row[3] != "VALID":
             raise IntentAuditorUnavailable("A current valid intent assessment is required.")
-        if row[1] == "UNCERTAIN":
-            raise IntentAuditorUnavailable("An uncertain intent assessment cannot authorize progression.")
-        active_versions = (SCHEMA_VERSION, PROMPT_VERSION, settings.GEMINI_MODEL)
-        stored_versions = row[5:8]
+        if row[4] == "UNCERTAIN":
+            raise IntentAuditorUnavailable(
+                "An uncertain intent assessment cannot authorize progression."
+            )
+        active_versions = (POLICY_VERSION, SCHEMA_VERSION, PROMPT_VERSION, settings.GEMINI_MODEL)
+        stored_versions = (row[10], row[11], row[12], row[13])
         if (not all(isinstance(version, str) and version for version in stored_versions)
                 or stored_versions != active_versions):
             raise IntentAuditorUnavailable("The intent assessment uses stale auditor versions.")
@@ -374,21 +380,82 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
             proposal, mandate, db=conn, daily_limit=daily_limit,
             oracle_result=oracle_result,
         )
-        if (row[2] != proposal.content_hash
-                or row[3] != mandate_permissions_hash(mandate)
-                or row[4] != policy_snapshot_hash(current)
+        if (row[1] != proposal.proposal_id
+                or row[2] != mandate.mandate_id
+                or row[7] != proposal.content_hash
+                or row[8] != mandate_permissions_hash(mandate)
+                or row[9] != policy_snapshot_hash(current)
                 or current.decision == DecisionOutcome.BLOCK):
             raise IntentAuditorUnavailable("The intent assessment is stale.")
+        try:
+            finding_codes = json.loads(row[5])
+            affected_fields = json.loads(row[6])
+            if not isinstance(finding_codes, list) or not isinstance(affected_fields, list):
+                raise ValueError("Assessment fields must be JSON arrays.")
+            finding_codes = [IntentFindingCode(value).value for value in finding_codes]
+            affected_fields = [IntentAffectedField(value).value for value in affected_fields]
+            risk_level = IntentRiskLevel(row[4]).value
+            if (len(finding_codes) != len(set(finding_codes))
+                    or len(affected_fields) != len(set(affected_fields))):
+                raise ValueError("Assessment fields contain duplicate enum values.")
+            for digest in (row[7], row[8], row[9]):
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)):
+                    raise ValueError("Assessment snapshot hash is malformed.")
+            created_at = datetime.fromisoformat(row[14])
+            if created_at.tzinfo is None:
+                raise ValueError("Assessment timestamp must be timezone-aware.")
+            if not all(isinstance(value, str) and value for value in (row[0], row[1], row[2])):
+                raise ValueError("Assessment identifiers are malformed.")
+            if row[15] is not None:
+                raise ValueError("A VALID assessment cannot contain a failure code.")
+            binding_payload = {
+                "affected_fields": sorted(affected_fields),
+                "assessment_id": row[0],
+                "assessment_status": row[3],
+                "created_at": row[14],
+                "finding_codes": sorted(finding_codes),
+                "failure_code": row[15],
+                "mandate_id": row[2],
+                "mandate_permissions_hash": row[8],
+                "model_identifier": row[13],
+                "policy_snapshot_hash": row[9],
+                "policy_version": row[10],
+                "prompt_version": row[12],
+                "proposal_content_hash": row[7],
+                "proposal_id": row[1],
+                "risk_level": risk_level,
+                "schema_version": row[11],
+            }
+            assessment_binding = hashlib.sha256(
+                json.dumps(
+                    binding_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IntentAuditorUnavailable("Persisted intent assessment is invalid.") from exc
         if (require_human_review and proposal.status.value == "APPROVED"
-                and (row[1] in {"MEDIUM", "HIGH"}
+                and (row[4] in {"MEDIUM", "HIGH"}
                      or current.decision == DecisionOutcome.REQUIRE_APPROVAL)):
             cursor = await conn.execute(
                 "SELECT 1 FROM approval_tokens WHERE proposal_id = ? "
-                "AND consumed_at IS NOT NULL LIMIT 1", (proposal.proposal_id,)
+                "AND owner_user_id = ? AND content_hash = ? "
+                "AND assessment_binding = ? AND consumed_at IS NOT NULL LIMIT 1",
+                (proposal.proposal_id, mandate.owner_user_id, proposal.content_hash,
+                 assessment_binding),
             )
             if await cursor.fetchone() is None:
                 raise IntentAuditorUnavailable("Required user review has not been recorded.")
-        return {"status": row[0], "risk_level": row[1]}
+        return {
+            "assessment_binding": assessment_binding,
+            "assessment_id": row[0],
+            "status": row[3],
+            "risk_level": risk_level,
+        }
     if db is not None:
         return await check(db)
     async with get_connection() as conn:

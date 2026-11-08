@@ -33,8 +33,9 @@ MIN_IDEMPOTENCY_KEY_LENGTH = 8
 class ProposalStatus(str, Enum):
     """Lifecycle states of a purchase proposal.
 
-    Evaluation and approval are recorded as status only. They do not execute
-    payment and do not alter proposal commercial terms.
+    APPROVED means durable explicit user purchase consent was recorded. It is
+    a lifecycle marker, not sufficient authorization evidence for payment; the
+    payment service independently validates the matching consent record.
     """
 
     SUBMITTED = "SUBMITTED"

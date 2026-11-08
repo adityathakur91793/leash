@@ -49,6 +49,7 @@ async def init_test_db(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
     async with aiosqlite.connect(get_db_path()) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("DELETE FROM paypal_orders")
+        await db.execute("DELETE FROM purchase_consents")
         await db.execute("DELETE FROM intent_assessments")
         await db.execute("DELETE FROM audit_checkpoints")
         await db.execute("DELETE FROM audit_logs")

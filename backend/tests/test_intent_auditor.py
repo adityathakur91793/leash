@@ -33,6 +33,7 @@ from app.schemas.proposal import ProposalStatus
 from app.schemas.policy import DecisionOutcome, PolicyDecision, RuleResult
 from app.services.approval_service import issue_approval_token, consume_approval_token
 from app.services.payment_service import create_payment_order, capture_payment_order
+from app.services.purchase_consent_service import record_purchase_consent
 
 
 def test_auditor_result_rejects_unrecognized_authority_fields() -> None:
@@ -163,12 +164,14 @@ async def test_deterministic_block_skips_auditor_and_migration_exists(monkeypatc
         assert (await cursor.fetchone())[0] >= 8
 
 
-async def _active_proposal(product_name: str = "Book"):
+async def _active_proposal(
+    product_name: str = "Book", *, require_user_approval: bool = False
+):
     mandate = await create_draft_mandate(MandateCreate(
         max_total_budget=Decimal("100.00"), currency="USD",
         allowed_merchants=["shop.example"], allowed_categories=["books"],
         max_item_count=2, max_quantity_per_item=1, allow_subscriptions=False,
-        require_user_approval=False,
+        require_user_approval=require_user_approval,
         expires_at=datetime.now(timezone.utc) + timedelta(days=1),
     ), owner_user_id="owner-test")
     await confirm_mandate(mandate.mandate_id)
@@ -194,6 +197,7 @@ async def _approve_explicitly(proposal_id: str, principal_id: str) -> None:
         nonce=issued["nonce"],
     )
     assert success, reason
+    await record_purchase_consent(proposal_id, principal_id)
 
 
 @pytest.mark.parametrize("risk, expected", [
@@ -325,7 +329,7 @@ async def test_assessment_version_mismatch_is_stale(field, current, monkeypatch)
 @pytest.mark.asyncio
 async def test_stale_assessment_blocks_approval_token_issuance(monkeypatch) -> None:
     from app.core.config import settings
-    proposal, mandate = await _active_proposal()
+    proposal, mandate = await _active_proposal(require_user_approval=True)
 
     async def medium(self, payload):
         return IntentAuditorResult(schema_version="1.0", risk_level="MEDIUM")
@@ -339,7 +343,7 @@ async def test_stale_assessment_blocks_approval_token_issuance(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_stale_assessment_blocks_approval_token_consumption(monkeypatch) -> None:
-    proposal, _ = await _active_proposal()
+    proposal, _ = await _active_proposal(require_user_approval=True)
 
     async def medium(self, payload):
         return IntentAuditorResult(schema_version="1.0", risk_level="MEDIUM")
@@ -376,7 +380,7 @@ class _PayPalOrderStub:
 
 @pytest.mark.asyncio
 async def test_stale_assessment_blocks_payment_order_creation() -> None:
-    proposal, _ = await _active_proposal()
+    proposal, _ = await _active_proposal(require_user_approval=True)
     await evaluate_proposal_service(proposal.proposal_id)
     await _approve_explicitly(proposal.proposal_id, "owner-test")
     await _set_assessment_version(proposal.proposal_id, "schema_version", "0.9")
@@ -388,7 +392,7 @@ async def test_stale_assessment_blocks_payment_order_creation() -> None:
 
 @pytest.mark.asyncio
 async def test_stale_assessment_blocks_payment_capture() -> None:
-    proposal, _ = await _active_proposal()
+    proposal, _ = await _active_proposal(require_user_approval=True)
     await evaluate_proposal_service(proposal.proposal_id)
     await _approve_explicitly(proposal.proposal_id, "owner-test")
     paypal = _PayPalOrderStub()

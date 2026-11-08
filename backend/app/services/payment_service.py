@@ -4,7 +4,7 @@ Orchestrates PayPal Sandbox checkout creation, buyer approval verification,
 and order capture for policy-authorized purchase proposals.
 
 Security Architecture:
-- Proposal must be in APPROVED state; settled proposals cannot be executed again.
+- Proposal must be APPROVED and have a current durable purchase-consent binding.
 - Mandate ownership is strictly enforced against authenticated session principal.
 - Mandate must be ACTIVE and not expired.
 - Budget constraints (total remaining, per-item, merchant/category whitelist) are rechecked.
@@ -51,6 +51,7 @@ from app.services.paypal_service import (
     PayPalOrderError,
 )
 from app.services.proposal_service import CurrencyMismatchError, ProposalNotFoundError
+from app.services.purchase_consent_service import require_current_purchase_consent
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,10 @@ async def create_payment_order(
         raise PaymentProposalNotApprovedError(
             f"Proposal '{proposal_id}' is in status '{proposal.status.value}', expected 'APPROVED'."
         )
+
+    # Legacy APPROVED rows are not evidence of consent. Require the durable
+    # consent and compare it to current policy/mandate/terms before PayPal calls.
+    await require_current_purchase_consent(proposal_id, principal_id)
 
     mandate = await get_mandate_from_db(proposal.mandate_id)
     if mandate is None:
@@ -299,6 +304,9 @@ async def create_payment_order(
             current_mandate = await get_mandate_from_db(mandate.mandate_id, db=conn)
             if current_proposal is None or current_mandate is None:
                 raise PaymentProposalNotApprovedError("Proposal authorization changed.")
+            await require_current_purchase_consent(
+                proposal_id, principal_id, db=conn
+            )
             await require_current_assessment(
                 current_proposal, current_mandate, db=conn, require_human_review=True
             )
@@ -438,6 +446,8 @@ async def capture_payment_order(
             f"expected 'APPROVED'."
         )
 
+    await require_current_purchase_consent(order_record.proposal_id, principal_id)
+
     from app.services.intent_audit_service import require_current_assessment
     await require_current_assessment(proposal, mandate, require_human_review=True)
 
@@ -549,6 +559,9 @@ async def capture_payment_order(
             current_mandate = await get_mandate_from_db(mandate.mandate_id, db=conn)
             if current_proposal is None or current_mandate is None:
                 raise PaymentProposalNotApprovedError("Proposal authorization changed before capture.")
+            await require_current_purchase_consent(
+                current_proposal.proposal_id, principal_id, db=conn
+            )
             from app.services.intent_audit_service import require_current_assessment
             await require_current_assessment(
                 current_proposal, current_mandate, db=conn, require_human_review=True

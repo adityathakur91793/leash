@@ -23,25 +23,21 @@ import secrets
 from app.core.config import settings
 from app.db.database import (
     get_connection,
-    get_cumulative_mandate_spent,
-    get_proposal_by_fingerprint,
-    get_proposal_by_idempotency_key,
-    get_today_reserved_spend,
     is_kill_switch_active,
 )
 from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
-from app.schemas.policy import DecisionOutcome, EvaluationContext, RuleStatus
+from app.schemas.policy import DecisionOutcome, RuleStatus
 from app.schemas.proposal import ProposalStatus
 from app.services.audit_service import AuditService
 from app.services.kill_switch_service import enforce_kill_switch_guard
 from app.services.mandate_service import MandateNotFoundError, get_mandate
 from app.services.policy_engine import (
-    evaluate_policy,
     generate_approval_token,
     register_approval_token,
     verify_and_consume_approval_token,
 )
 from app.services.proposal_service import ProposalNotFoundError, get_proposal
+from app.services.intent_audit_service import current_policy_decision
 
 logger = logging.getLogger(__name__)
 
@@ -100,54 +96,23 @@ async def issue_approval_token(
         )
 
     now = datetime.now(timezone.utc)
-    today_iso = now.date().isoformat()
+    decision = await current_policy_decision(proposal, mandate, now=now)
 
-    async with get_connection() as db:
-        today_reserved = await get_today_reserved_spend(
-            mandate.mandate_id,
-            today_iso,
-            exclude_proposal_id=proposal_id,
-            db=db,
-        )
-        cumulative_spent = await get_cumulative_mandate_spent(
-            mandate.mandate_id,
-            exclude_proposal_id=proposal_id,
-            db=db,
-        )
-        existing_fp = await get_proposal_by_fingerprint(proposal.fingerprint, db=db)
-        existing_ik = None
-        if proposal.idempotency_key:
-            existing_ik = await get_proposal_by_idempotency_key(
-                proposal.idempotency_key, db=db
-            )
-
-    context = EvaluationContext(
-        now=now,
-        today_reserved=today_reserved,
-        cumulative_mandate_spent=cumulative_spent,
-    )
-
-    decision = evaluate_policy(
-        proposal=proposal,
-        mandate=mandate,
-        context=context,
-        existing_by_fingerprint=existing_fp,
-        existing_by_idempotency_key=existing_ik,
-    )
-
-    if decision.decision == DecisionOutcome.BLOCK:
-        # Check if any hard BLOCK rule fired
-        for rule in decision.rules:
-            if rule.rule_id in HARD_BLOCK_RULES and rule.status == RuleStatus.BLOCK:
-                raise ValueError(
-                    f"Hard BLOCK rule {rule.rule_id} prevents approval token issuance."
-                )
+    if decision.decision != DecisionOutcome.REQUIRE_APPROVAL:
+        if decision.decision == DecisionOutcome.BLOCK:
+            # Keep the explicit hard-rule explanation for deterministic BLOCKs.
+            for rule in decision.rules:
+                if rule.rule_id in HARD_BLOCK_RULES and rule.status == RuleStatus.BLOCK:
+                    raise ValueError(
+                        f"Hard BLOCK rule {rule.rule_id} prevents approval token issuance."
+                    )
         raise ValueError(
-            "Policy evaluation resulted in BLOCK; approval token not issued."
+            f"Policy evaluation resulted in {decision.decision.value}; "
+            "approval token not issued because tokens are only valid for REQUIRE_APPROVAL."
         )
 
     from app.services.intent_audit_service import require_current_assessment
-    await require_current_assessment(proposal, mandate)
+    assessment = await require_current_assessment(proposal, mandate)
     if proposal.status != ProposalStatus.EVALUATED:
         raise ValueError("Only evaluated proposals requiring user review may receive a token.")
 
@@ -162,6 +127,7 @@ async def issue_approval_token(
         approval_timestamp=issued_at,
         nonce=nonce,
         expires_at=expires_at,
+        assessment_binding=assessment["assessment_binding"],
     )
 
     # Atomically register token hash and append audit event in a single transaction
@@ -172,15 +138,31 @@ async def issue_approval_token(
                 raise RuntimeError("Emergency kill switch is active. Approval halted.")
             current_proposal = await get_proposal(proposal_id, db=db)
             current_mandate = await get_mandate(current_proposal.mandate_id, db=db)
-            assessment = await require_current_assessment(current_proposal, current_mandate, db=db)
+            if current_mandate.owner_user_id != principal_id:
+                raise MandateOwnershipError("Principal does not own this mandate.")
+            current_decision = await current_policy_decision(
+                current_proposal, current_mandate, now=issued_at, db=db
+            )
+            if current_decision.decision != DecisionOutcome.REQUIRE_APPROVAL:
+                raise ValueError(
+                    "Current policy outcome does not permit approval-token issuance."
+                )
+            current_assessment = await require_current_assessment(
+                current_proposal, current_mandate, db=db
+            )
+            if current_assessment["assessment_binding"] != assessment["assessment_binding"]:
+                raise ValueError("Intent assessment changed during token issuance.")
             if current_proposal.status != ProposalStatus.EVALUATED:
                 raise ValueError("Proposal is no longer awaiting user review.")
             await register_approval_token(
                 token=token,
                 proposal_id=proposal_id,
+                owner_user_id=principal_id,
+                content_hash=current_proposal.content_hash,
                 approval_timestamp=issued_at,
                 ttl_seconds=_TOKEN_TTL_SECONDS,
                 db=db,
+                assessment_binding=current_assessment["assessment_binding"],
             )
             await AuditService.append_event(
                 event_type=AuditEventType.EXCEPTION_APPROVED,
@@ -257,61 +239,26 @@ async def consume_approval_token(
         )
 
     now = datetime.now(timezone.utc)
-    today_iso = now.date().isoformat()
+    decision = await current_policy_decision(proposal, mandate, now=now)
 
-    # 2. Re-evaluate policy independently (backend deterministic verification)
-    async with get_connection() as db:
-        today_reserved = await get_today_reserved_spend(
-            mandate.mandate_id,
-            today_iso,
-            exclude_proposal_id=proposal_id,
-            db=db,
+    # The token workflow only handles explicit review outcomes. Check policy before
+    # assessment freshness so BLOCK remains the authoritative denial reason.
+    if decision.decision != DecisionOutcome.REQUIRE_APPROVAL:
+        reason = (
+            f"Policy evaluation resulted in {decision.decision.value}; "
+            "approval token cannot be consumed outside REQUIRE_APPROVAL."
         )
-        cumulative_spent = await get_cumulative_mandate_spent(
-            mandate.mandate_id,
-            exclude_proposal_id=proposal_id,
-            db=db,
-        )
-        existing_fp = await get_proposal_by_fingerprint(proposal.fingerprint, db=db)
-        existing_ik = None
-        if proposal.idempotency_key:
-            existing_ik = await get_proposal_by_idempotency_key(
-                proposal.idempotency_key, db=db
-            )
-
-    context = EvaluationContext(
-        now=now,
-        today_reserved=today_reserved,
-        cumulative_mandate_spent=cumulative_spent,
-    )
-
-    decision = evaluate_policy(
-        proposal=proposal,
-        mandate=mandate,
-        context=context,
-        existing_by_fingerprint=existing_fp,
-        existing_by_idempotency_key=existing_ik,
-    )
+        await _record_consume_failure_audit(proposal_id, principal_id, reason)
+        return False, reason
 
     from app.services.intent_audit_service import require_current_assessment
     try:
-        await require_current_assessment(proposal, mandate)
-    except Exception as exc:
-        await _record_consume_failure_audit(proposal_id, principal_id, "Intent assessment missing or stale.")
+        assessment = await require_current_assessment(proposal, mandate)
+    except Exception:
+        await _record_consume_failure_audit(
+            proposal_id, principal_id, "Intent assessment missing or stale."
+        )
         return False, "A current valid intent assessment is required."
-
-    # 3. Check no hard BLOCK rules
-    if decision.decision == DecisionOutcome.BLOCK:
-        for rule in decision.rules:
-            if rule.rule_id in HARD_BLOCK_RULES and rule.status == RuleStatus.BLOCK:
-                reason = (
-                    f"Hard BLOCK rule {rule.rule_id} cannot be overridden by approval token."
-                )
-                await _record_consume_failure_audit(proposal_id, principal_id, reason)
-                return False, reason
-        reason = "Policy evaluation resulted in BLOCK; approval token cannot override."
-        await _record_consume_failure_audit(proposal_id, principal_id, reason)
-        return False, reason
 
     # 4. Parse issued_at from server-issued value (do NOT trust client timestamp)
     try:
@@ -333,17 +280,39 @@ async def consume_approval_token(
                 raise RuntimeError("Emergency kill switch is active. Approval halted.")
             current_proposal = await get_proposal(proposal_id, db=db)
             current_mandate = await get_mandate(current_proposal.mandate_id, db=db)
-            await require_current_assessment(current_proposal, current_mandate, db=db)
+            if current_mandate.owner_user_id != principal_id:
+                await db.rollback()
+                return False, "Principal does not own this mandate."
+            current_decision = await current_policy_decision(
+                current_proposal, current_mandate, now=now, db=db
+            )
+            if current_decision.decision != DecisionOutcome.REQUIRE_APPROVAL:
+                await db.rollback()
+                reason = (
+                    f"Current policy outcome is {current_decision.decision.value}; "
+                    "approval token cannot be consumed."
+                )
+                await _record_consume_failure_audit(proposal_id, principal_id, reason)
+                return False, reason
+            current_assessment = await require_current_assessment(
+                current_proposal, current_mandate, db=db
+            )
+            if current_assessment["assessment_binding"] != assessment["assessment_binding"]:
+                await db.rollback()
+                reason = "Intent assessment changed before token consumption."
+                await _record_consume_failure_audit(proposal_id, principal_id, reason)
+                return False, reason
             success, reason = await verify_and_consume_approval_token(
                 token=token,
                 proposal_id=proposal_id,
-                content_hash=proposal.content_hash,
+                content_hash=current_proposal.content_hash,
                 user_session_id=principal_id,
                 approval_timestamp=approval_timestamp,
                 nonce=nonce,
                 now=now,
                 ttl_seconds=_TOKEN_TTL_SECONDS,
                 db=db,
+                assessment_binding=current_assessment["assessment_binding"],
             )
             if not success:
                 await db.rollback()
@@ -352,21 +321,12 @@ async def consume_approval_token(
 
             if current_proposal.status != ProposalStatus.EVALUATED:
                 await db.rollback()
-                return False, "Proposal is no longer awaiting user review."
+                reason = "Proposal is no longer awaiting user review."
+                await _record_consume_failure_audit(proposal_id, principal_id, reason)
+                return False, reason
 
-            # Token consumed successfully — update proposal status if applicable
-            cursor = await db.execute(
-                """
-                UPDATE proposals
-                SET status = ?
-                WHERE proposal_id = ? AND status IN ('SUBMITTED', 'EVALUATED')
-                """,
-                (ProposalStatus.APPROVED.value, proposal_id),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("Proposal approval state changed concurrently.")
-
-            # Atomically append EXCEPTION_APPROVED audit event in the same transaction
+            # Exception review is not purchase consent; leave the proposal EVALUATED.
+            # The separate purchase-consent operation owns the APPROVED transition.
             await AuditService.append_event(
                 event_type=AuditEventType.EXCEPTION_APPROVED,
                 entity_type=AuditEntityType.PROPOSAL,
@@ -391,7 +351,11 @@ async def _record_consume_failure_audit(
     principal_id: str,
     reason: str,
 ) -> None:
-    """Record an audit event for rejected token consumption in its own transaction.
+    """Attempt to audit a rejected token consumption in its own transaction.
+
+    Audit append failures are logged and swallowed so the authorization rejection
+    remains in effect. Callers must not interpret return from this helper as proof
+    that the event was persisted.
 
     Args:
         proposal_id: The proposal whose token consumption failed.

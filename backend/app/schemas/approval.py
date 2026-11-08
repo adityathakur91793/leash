@@ -1,6 +1,8 @@
 """Pydantic schemas for one-time exception approval tokens."""
 
 from datetime import datetime
+from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,3 +66,25 @@ class ApprovalConsumeResponse(BaseModel):
     success: bool
     reason: str
     proposal_id: str
+
+
+class PurchaseConsentRequest(BaseModel):
+    """Explicit authenticated confirmation to authorize one proposal for purchase."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_purchase: Literal[True]
+
+
+class PurchaseConsentResponse(BaseModel):
+    """Minimized public result of a server-recorded purchase consent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_id: str
+    status: Literal["APPROVED"]
+    policy_decision: Literal["ALLOW", "REQUIRE_APPROVAL"]
+    amount: Decimal
+    currency: str
+    consented_at: datetime
+    idempotent: bool

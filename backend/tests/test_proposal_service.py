@@ -19,6 +19,7 @@ from app.services.mandate_service import (
 from app.services.proposal_service import (
     CurrencyMismatchError,
     DuplicateProposalConflictError,
+    InvalidProposalStatusTransitionError,
     ProposalImmutableError,
     ProposalTamperedError,
     create_proposal,
@@ -132,10 +133,8 @@ async def test_evaluated_proposal_is_immutable() -> None:
     with pytest.raises(ProposalImmutableError):
         await reject_content_mutation(proposal.proposal_id)
 
-    approved = await set_proposal_status(proposal.proposal_id, ProposalStatus.APPROVED)
-    assert approved.status == ProposalStatus.APPROVED
-    assert approved.unit_price == Decimal("12.50")
-    assert approved.total == Decimal("16.00")
+    with pytest.raises(InvalidProposalStatusTransitionError, match="purchase-consent"):
+        await set_proposal_status(proposal.proposal_id, ProposalStatus.APPROVED)
 
     with pytest.raises(ProposalImmutableError):
         await set_proposal_status(proposal.proposal_id, ProposalStatus.SUBMITTED)

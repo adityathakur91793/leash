@@ -497,18 +497,23 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
 
     now = datetime.now(timezone.utc)
     nonce = "nonce_rem_single_use"
+    assessment_binding = "a" * 64
     token = generate_approval_token(
         proposal_id=proposal.proposal_id,
         content_hash=proposal.content_hash,
         user_session_id="user_sess_123",
         approval_timestamp=now,
         nonce=nonce,
+        assessment_binding=assessment_binding,
     )
 
     # Pre-register token
     await register_approval_token(
         token=token,
         proposal_id=proposal.proposal_id,
+        owner_user_id="user_sess_123",
+        content_hash=proposal.content_hash,
+        assessment_binding=assessment_binding,
         approval_timestamp=now,
         ttl_seconds=900,
     )
@@ -521,6 +526,7 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
         user_session_id="user_sess_123",
         approval_timestamp=now,
         nonce=nonce,
+        assessment_binding=assessment_binding,
         now=now,
     )
     assert success is True
@@ -534,6 +540,7 @@ async def test_remediation_persistent_approval_token_single_use() -> None:
         user_session_id="user_sess_123",
         approval_timestamp=now,
         nonce=nonce,
+        assessment_binding=assessment_binding,
         now=now + timedelta(seconds=1),
     )
     assert success_replay is False
@@ -549,12 +556,14 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
 
     now = datetime.now(timezone.utc)
     nonce = "nonce_rem_concurrent"
+    assessment_binding = "b" * 64
     token = generate_approval_token(
         proposal_id=proposal.proposal_id,
         content_hash=proposal.content_hash,
         user_session_id="sess_conc_456",
         approval_timestamp=now,
         nonce=nonce,
+        assessment_binding=assessment_binding,
     )
 
     # Two concurrent requests presenting the same approval token
@@ -566,6 +575,7 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
             user_session_id="sess_conc_456",
             approval_timestamp=now,
             nonce=nonce,
+            assessment_binding=assessment_binding,
             now=now,
         ),
         verify_and_consume_approval_token(
@@ -575,6 +585,7 @@ async def test_remediation_approval_token_concurrent_replay_prevention() -> None
             user_session_id="sess_conc_456",
             approval_timestamp=now,
             nonce=nonce,
+            assessment_binding=assessment_binding,
             now=now,
         ),
     )

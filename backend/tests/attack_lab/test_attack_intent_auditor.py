@@ -28,6 +28,7 @@ from app.services.mandate_service import (
     revoke_mandate,
 )
 from app.services.payment_service import create_payment_order
+from app.services.purchase_consent_service import record_purchase_consent
 from app.services.proposal_service import evaluate_proposal_service, get_proposal
 from tests.attack_lab.support import AttackCase, AsyncBarrier, ScriptedHTTPX
 
@@ -81,6 +82,7 @@ async def _approve_with_token(proposal_id: str, principal_id: str) -> None:
         nonce=issued["nonce"],
     )
     assert success, reason
+    await record_purchase_consent(proposal_id, principal_id)
 
 
 async def _tamper_policy_evidence(proposal_id: str) -> None:
@@ -92,15 +94,15 @@ async def _tamper_policy_evidence(proposal_id: str) -> None:
         await db.commit()
 
 
-async def _automatic_case(
+async def _review_required_case(
     owner_user_id: str,
     attack_factories: dict[str, Any],
     *,
     product_id: str,
 ) -> tuple[Mandate, Proposal]:
-    """Build a valid owned proposal whose policy permits automatic LOW-risk approval."""
+    """Build a valid proposal that still requires explicit user approval."""
     mandate = await attack_factories["mandate"](
-        owner_user_id, require_user_approval=False
+        owner_user_id, require_user_approval=True
     )
     proposal = await attack_factories["proposal"](
         mandate.mandate_id, product_id=product_id
@@ -329,7 +331,7 @@ async def test_stale_binding_blocks_payment_order_creation(
     verify_attack_audit_chain: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mandate, proposal = await _automatic_case(
+    mandate, proposal = await _review_required_case(
         attack_case.user_a.user_id,
         attack_factories,
         product_id=f"stale-{binding.replace('_', '-')}-payment",
@@ -489,7 +491,7 @@ async def test_stale_binding_blocks_payment_order_creation(
     verify_attack_audit_chain: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mandate, proposal = await _automatic_case(
+    mandate, proposal = await _review_required_case(
         attack_case.user_a.user_id,
         attack_factories,
         product_id=f"stale-{binding.replace('_', '-')}-payment",
