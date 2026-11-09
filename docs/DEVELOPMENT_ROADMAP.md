@@ -40,4 +40,9 @@
 - [x] Capture reservation, provider lookup reconciliation, and backend-verified return flow.
 - [x] Authenticated frontend checkout, cancellation, pending and confirmed-settlement states.
 - [ ] Confirm Sandbox idempotency retention, build automated reconciliation and alerting, and provide a reviewed least-privilege operator recovery path.
-- Manual reconciliation procedure: see [Payment Operations](PAYMENT_OPERATIONS.md). Unresolved attempts require operator intervention; attempts past the six-hour key window without a stored provider order ID remain blocked because no supported local recovery endpoint can attach the discovered ID.
+- Owner-authenticated factual reconciliation is available for persisted orders with an anchored provider order ID; unresolved order-attempt cases that lack one may still require operator intervention. See [Payment Operations](PAYMENT_OPERATIONS.md).
+
+## Phase 7H: Dashboard, activity and audit presentation
+- [x] Owner-scoped operational dashboard using mandate, proposal, payment and settlement records.
+- [x] Read-only activity/audit projection with minimized fields and hash-chain integrity caveat.
+- [x] Responsive navigation and account overview presentation.

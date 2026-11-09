@@ -2,6 +2,33 @@
 
 Base URL: `http://localhost:8000`
 
+## Phase 7H Authenticated Activity Overview
+
+### GET /api/v1/activity/overview
+
+Requires an active `Authorization: Bearer <session_token>` session. The server
+derives the principal from that session and returns only audit events attached
+to that principal's mandates, proposals, and PayPal orders/order attempts.
+
+The response is a strict public projection. It includes recent event timestamp,
+event/entity category, safe actor label, human-readable summary,
+product/mandate display label, and exact amount/currency when applicable. It
+does not return raw payloads, owner IDs, entity IDs, hashes, signatures,
+idempotency keys, provider order IDs, or source URLs. The result also includes
+all mandate and proposal lifecycle counts, current payment status counts, and
+exact confirmed settlement count/totals grouped by currency, plus a distinct
+owner-scoped count of unresolved checkout attempts in `UNKNOWN`,
+`PROVIDER_CREATED`, or `RECONCILIATION_REQUIRED` state that lack a local PayPal
+order row. Attempts remain separate from payment counts and settlements. Global
+audit sequence numbers are not part of the public response. Expired mandate
+windows are reflected as expired in the overview without mutating stored data.
+Only completed local orders with a persisted capture ID count as confirmed
+settlements.
+
+`hash_chain_valid` reports cryptographic audit-chain verification only. It does
+not establish that the underlying event or business decision was correct.
+Activity is read-only; event history remains append-only.
+
 ---
 
 ## Phase 1 Foundation Endpoints
@@ -345,8 +372,9 @@ requires a valid session renewal or another active session for that principal.
 ### POST /api/v1/policies
 User-level policy configuration and evaluation against an active mandate.
 
-### GET /api/v1/audit/logs
-Retrieve immutable audit logs.
+Full audit logs and chain-verification diagnostics are available only through the
+admin-authenticated `/api/v1/admin/audit/...` endpoints. The user-facing,
+owner-scoped display projection is `GET /api/v1/activity/overview` above.
 
 ### Payment execution
 PayPal capture remains out of band from proposal creation.

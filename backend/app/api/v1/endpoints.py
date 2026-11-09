@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.api.v1.activity import router as activity_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.approval import router as approval_router
 from app.api.v1.mandates import router as mandates_router
@@ -31,3 +32,4 @@ router.include_router(admin_router)
 router.include_router(approval_router)
 router.include_router(payments_router)
 router.include_router(shopping_agent_router)
+router.include_router(activity_router)

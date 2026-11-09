@@ -74,3 +74,9 @@ LEASH is a security-focused agentic commerce platform that ensures AI purchasing
 - Browser return parameters are references only. The authenticated backend verifies the local order and fetches PayPal state before recording approval or settlement. The frontend never treats redirect state as success.
 - The adapter accepts the PayPal Orders v2 `approve` and `payer-action` HATEOAS relations only when their URLs pass the allowlisted Sandbox host checks. See [PayPal Orders v2 create-order response](https://developer.paypal.com/sdk/orders/v2/orders-create/).
 - Migration 8 stores bounded structured assessments and audit events; raw prompts and model response text are not persisted.
+
+## Phase 7H Activity and audit presentation
+- The dashboard uses authenticated owner-scoped mandate/proposal lists and a single `GET /api/v1/activity/overview` request for recent activity and payment summaries.
+- The activity endpoint joins audit entities through the authenticated principal's owned mandates and proposals. It returns a strict display projection rather than raw audit payloads or chain hashes.
+- The projection reports hash-chain verification separately and explicitly states that log integrity is not business correctness. The existing full audit log endpoints remain admin-only.
+- Overview counts treat an elapsed mandate as expired without writing to the mandate or audit tables; completed settlements require a persisted capture ID.
