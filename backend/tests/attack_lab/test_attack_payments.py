@@ -98,8 +98,10 @@ async def test_concurrent_capture_rereads_order_after_ambiguous_first_attempt(
                     both_paypal_approvals.set()
                 await both_paypal_approvals.wait()
             return {
+                    "id": order_id,
                 "status": "APPROVED",
                 "purchase_units": [{
+                        "reference_id": proposal.proposal_id,
                     "amount": {"currency_code": "USD", "value": "16.00"}
                 }],
             }
@@ -182,5 +184,6 @@ async def test_concurrent_capture_rereads_order_after_ambiguous_first_attempt(
         )
         payment_events = [row[0] for row in await cursor.fetchall()]
     assert payment_events.count("PAYMENT_FAILED") == 1
+    assert payment_events.count("PAYMENT_CAPTURE_ATTEMPTED") == 1
     assert "PAYMENT_CAPTURED" not in payment_events
     assert (await verify_attack_audit_chain()).valid is True

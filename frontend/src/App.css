@@ -876,3 +876,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .intent-assessment-list li, .intent-assessment-fields li { flex-direction: column; gap: 0.2rem; }
   .intent-assessment-list li code, .intent-assessment-fields li code { text-align: left; }
 }
+.paypal-checkout-card{margin-top:1.25rem;padding:1.25rem;border:1px solid #ded8f4;border-radius:16px;background:linear-gradient(145deg,#fff 0%,#faf8ff 100%);box-shadow:0 8px 24px rgba(74,48,130,.07)}
+.checkout-heading{display:flex;gap:.75rem;align-items:flex-start;color:#5c3bb5}.checkout-heading h3{margin:0;color:#241b38}.checkout-heading p{margin:.35rem 0 0;color:#655d73;line-height:1.5}
+.checkout-actions{display:flex;flex-wrap:wrap;gap:.75rem;margin-top:1rem}.checkout-pending,.checkout-error,.checkout-return{padding:.85rem 1rem;margin:.75rem 0;border-radius:10px;line-height:1.5}.checkout-pending{display:flex;gap:.5rem;background:#fff8e8;color:#73520b}.checkout-error,.checkout-return-error{background:#fff0f1;color:#8b2630}.checkout-return{background:#f5f1ff;color:#443270}.checkout-return-complete{background:#eef9f2;color:#205a37}.checkout-return-cancel,.checkout-return-approved{background:#f5f1ff;color:#443270}
+@media(max-width:600px){.paypal-checkout-card{padding:1rem}.checkout-actions{display:grid}.checkout-actions button{width:100%}}

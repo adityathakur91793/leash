@@ -77,6 +77,13 @@ function ConfirmationDialog({ proposal, busy, error, retrying, onCancel, onConfi
         aria-labelledby="purchase-confirmation-title"
         aria-describedby="purchase-confirmation-description"
         ref={dialogRef}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape' && !busy) {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+          }
+        }}
       >
         <div className="approval-dialog-icon" aria-hidden="true"><LockKeyhole size={22} /></div>
         <h2 id="purchase-confirmation-title">Confirm purchase consent</h2>

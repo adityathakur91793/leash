@@ -291,6 +291,55 @@ MEDIUM/HIGH remain in EVALUATED for user review, and UNCERTAIN/provider failure
 returns a safe service-unavailable response without enabling approval or payment.
 Assessment detail is bounded and does not expose provider prompts or secrets.
 
+## Phase 3 PayPal Sandbox Checkout
+
+### POST /api/v1/proposals/{proposal_id}/create-order
+
+Requires an authenticated session and current durable purchase consent. Creates or
+resumes the proposal's single PayPal Sandbox order attempt. Repeated requests reuse
+the same provider idempotency key; an uncertain result never receives a new key. If
+no provider ID is known, key replay is refused after the documented six-hour Orders
+API idempotency window and the attempt remains pending operator reconciliation.
+
+### GET /api/v1/proposals/{proposal_id}/checkout
+
+Returns the authenticated owner's persisted attempt/order state for reload recovery:
+status, amount/currency, and whether current consent exists. When current consent is
+valid, provider order ID and approval URL may be returned. Otherwise those provider
+identifiers are omitted; `recovery_available` indicates an anchored order can be
+verified through the owner-scoped recovery operation. Consent hashes are never
+returned.
+The approval URL comes from PayPal's `approve` or `payer-action` response relation
+and must be a verified PayPal Sandbox host.
+
+### POST /api/v1/payments/return
+
+Accepts proposal and order identifiers as untrusted browser references. The backend
+checks local ownership and queries PayPal. Buyer approval is not payment settlement;
+`payment_completed` is true only after server-verified capture with a real capture ID.
+
+### POST /api/v1/proposals/{proposal_id}/checkout/reconcile
+
+Requires the authenticated proposal owner and takes no browser-supplied order ID.
+LEASH loads the durable attempt/order internally and fetches current provider state.
+Only an independently verified completed capture is recorded as settlement. Other
+provider states remain non-success and cannot authorize a capture through this
+operation. The response contains proposal and status fields only, no PayPal order
+ID, capture ID, or approval URL.
+
+### POST /api/v1/payments/{order_id}/capture
+
+Revalidates proposal, mandate, assessment, budget and durable consent. Ambiguous
+outcomes become `RECONCILIATION_REQUIRED` and are never blindly recaptured.
+
+Operational handling for expired or unresolved attempts is documented in
+[`PAYMENT_OPERATIONS.md`](PAYMENT_OPERATIONS.md). It describes the limits of
+existing recovery endpoints and does not define an operator API.
+
+The current session model has no persistent account identity. A newly created
+anonymous session cannot recover another principal's proposal; same-owner recovery
+requires a valid session renewal or another active session for that principal.
+
 ## Phase 2C+ Endpoints (Planned)
 
 ### POST /api/v1/policies

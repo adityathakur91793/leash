@@ -130,6 +130,27 @@ async def test_migration_7_creates_paypal_orders_schema() -> None:
 
 
 @pytest.mark.asyncio
+async def test_migration_11_creates_durable_paypal_order_attempts() -> None:
+    import aiosqlite
+    from app.db.database import get_db_path
+
+    async with aiosqlite.connect(get_db_path()) as db:
+        version = await (await db.execute(
+            "SELECT MAX(version) FROM schema_version"
+        )).fetchone()
+        assert version[0] >= 11
+        table = await (await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            ("paypal_order_attempts",),
+        )).fetchone()
+        assert table == ("paypal_order_attempts",)
+        indexes = {row[1] for row in await (await db.execute(
+            "PRAGMA index_list(paypal_order_attempts)"
+        )).fetchall()}
+        assert "idx_paypal_attempt_owner" in indexes
+
+
+@pytest.mark.asyncio
 async def test_paypal_order_reconciliation_cannot_demote_completed_order() -> None:
     """A late timeout handler must not overwrite concurrent capture success."""
     import aiosqlite

@@ -47,3 +47,10 @@ proposal APIs in 2B do not approve purchases or capture payment.
 - **Defense-in-Depth for Untrusted Text**: Rule P12 enforces strict structural integrity, rejects URI credentials, and blocks SSRF target hosts. Prompt injection patterns are flagged as audit heuristics, while true safety is guaranteed by treating product copy as opaque literal text that is never interpreted or executed.
 **Rationale**: Eliminates non-deterministic LLM hallucinations and prompt injections from the trust boundary, ensuring mathematical enforceability of user-granted purchase authority.
 **Trade-offs**: Policy engine requires structured schema fields and does not support fuzzy natural-language purchase rules.
+
+
+## DL-007: Durable PayPal order attempts (Phase 7G)
+**Date**: 2026-11-09
+**Decision**: Persist one proposal-unique checkout attempt, exact consent/amount/currency binding, provider request ID, and state before calling PayPal. Reconciliation reuses the exact request key only within PayPal's documented Orders API idempotency window; after that, attempts fail closed for manual reconciliation.
+**Rationale**: A provider order can exist even when the client times out or local order finalization fails. A durable attempt makes that outcome discoverable and prevents generation of a second key for the same proposal.
+**Trade-offs**: Ambiguous attempts that remain unresolved beyond the provider key retention window require operator reconciliation; Phase 7G does not add an automated operations queue.

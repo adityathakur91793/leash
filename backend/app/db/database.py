@@ -22,7 +22,12 @@ from app.schemas.audit import (
 )
 from app.schemas.kill_switch import KillSwitchStatus
 from app.schemas.mandate import Mandate, MandateStatus
-from app.schemas.payment import PayPalOrderRecord, PayPalOrderStatus
+from app.schemas.payment import (
+    OrderAttemptStatus,
+    PayPalOrderAttempt,
+    PayPalOrderRecord,
+    PayPalOrderStatus,
+)
 from app.schemas.proposal import Proposal, ProposalStatus
 
 logger = logging.getLogger(__name__)
@@ -64,9 +69,9 @@ async def get_connection(url: str | None = None) -> AsyncIterator[aiosqlite.Conn
 
 async def init_db(*, _target_version: int | None = None) -> None:
     """Create database tables and apply incremental schema migrations."""
-    target_version = 10 if _target_version is None else _target_version
-    if not 1 <= target_version <= 10:
-        raise ValueError("Database migration target must be between versions 1 and 10.")
+    target_version = 11 if _target_version is None else _target_version
+    if not 1 <= target_version <= 11:
+        raise ValueError("Database migration target must be between versions 1 and 11.")
     db_path: str = get_db_path()
 
     if db_path != ":memory:":
@@ -566,6 +571,44 @@ async def init_db(*, _target_version: int | None = None) -> None:
             )
             current_version = 10
             logger.info("Applied migration version 10 (auditor-bound purchase consent)")
+
+        # Migration 11: durable one-shot PayPal order attempts. Existing orders
+        # remain untouched; attempts are created only for new checkout requests.
+        if current_version < 11 and target_version >= 11:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS paypal_order_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL UNIQUE,
+                    owner_user_id TEXT NOT NULL,
+                    consent_id TEXT NOT NULL,
+                    consent_binding_hash TEXT NOT NULL,
+                    expected_amount TEXT NOT NULL,
+                    expected_currency TEXT NOT NULL,
+                    provider_request_id TEXT NOT NULL UNIQUE,
+                    return_url TEXT NOT NULL,
+                    cancel_url TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'PREPARED', 'REQUESTING', 'UNKNOWN', 'PROVIDER_CREATED',
+                        'FAILED', 'RECONCILIATION_REQUIRED'
+                    )),
+                    provider_order_id TEXT UNIQUE,
+                    approval_url TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (proposal_id) REFERENCES proposals(proposal_id),
+                    FOREIGN KEY (consent_id) REFERENCES purchase_consents(consent_id)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paypal_attempt_owner "
+                "ON paypal_order_attempts(owner_user_id, proposal_id)"
+            )
+            await db.execute(
+                "INSERT INTO schema_version (version, applied_at) "
+                "VALUES (11, datetime('now'))"
+            )
+            current_version = 11
+            logger.info("Applied migration version 11 (durable PayPal order attempts)")
 
         await db.commit()
 
@@ -1711,6 +1754,73 @@ async def insert_paypal_order_in_db(
         await conn.commit()
 
 
+def _row_to_paypal_attempt(row: aiosqlite.Row) -> PayPalOrderAttempt:
+    return PayPalOrderAttempt(
+        attempt_id=row["attempt_id"], proposal_id=row["proposal_id"],
+        owner_user_id=row["owner_user_id"], consent_id=row["consent_id"],
+        consent_binding_hash=row["consent_binding_hash"],
+        expected_amount=Decimal(row["expected_amount"]),
+        expected_currency=row["expected_currency"],
+        provider_request_id=row["provider_request_id"],
+        return_url=row["return_url"], cancel_url=row["cancel_url"],
+        status=OrderAttemptStatus(row["status"]),
+        provider_order_id=row["provider_order_id"], approval_url=row["approval_url"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+async def get_paypal_attempt_by_proposal(
+    proposal_id: str, db: aiosqlite.Connection | None = None
+) -> PayPalOrderAttempt | None:
+    query = "SELECT * FROM paypal_order_attempts WHERE proposal_id = ?"
+    if db is not None:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (proposal_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_attempt(row) if row else None
+    async with get_connection() as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(query, (proposal_id,)) as cursor:
+            row = await cursor.fetchone()
+            return _row_to_paypal_attempt(row) if row else None
+
+
+async def insert_paypal_attempt(
+    attempt: PayPalOrderAttempt, db: aiosqlite.Connection
+) -> None:
+    await db.execute(
+        """INSERT INTO paypal_order_attempts (
+            attempt_id, proposal_id, owner_user_id, consent_id, consent_binding_hash,
+            expected_amount, expected_currency, provider_request_id, status,
+            return_url, cancel_url, provider_order_id, approval_url, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (attempt.attempt_id, attempt.proposal_id, attempt.owner_user_id,
+         attempt.consent_id, attempt.consent_binding_hash,
+         f"{attempt.expected_amount:.2f}", attempt.expected_currency,
+         attempt.provider_request_id, attempt.status.value, attempt.return_url,
+         attempt.cancel_url, attempt.provider_order_id,
+         attempt.approval_url, attempt.created_at.astimezone(timezone.utc).isoformat(),
+         attempt.updated_at.astimezone(timezone.utc).isoformat()),
+    )
+
+
+async def transition_paypal_attempt(
+    attempt_id: str, expected: OrderAttemptStatus, status: OrderAttemptStatus,
+    updated_at: datetime, *, provider_order_id: str | None = None,
+    approval_url: str | None = None, db: aiosqlite.Connection,
+) -> bool:
+    cursor = await db.execute(
+        """UPDATE paypal_order_attempts SET status = ?, updated_at = ?,
+            provider_order_id = COALESCE(?, provider_order_id),
+            approval_url = COALESCE(?, approval_url)
+        WHERE attempt_id = ? AND status = ?""",
+        (status.value, updated_at.astimezone(timezone.utc).isoformat(),
+         provider_order_id, approval_url, attempt_id, expected.value),
+    )
+    return cursor.rowcount == 1
+
+
 async def get_paypal_order_from_db(
     order_id: str, db: aiosqlite.Connection | None = None
 ) -> PayPalOrderRecord | None:
@@ -1761,7 +1871,7 @@ async def update_paypal_order_captured_in_db(
             capture_request_id = ?,
             captured_at = ?,
             updated_at = ?
-        WHERE order_id = ? AND status != ?
+        WHERE order_id = ? AND (status != ? OR capture_id IS NULL)
     """
     params = (
         PayPalOrderStatus.COMPLETED.value,

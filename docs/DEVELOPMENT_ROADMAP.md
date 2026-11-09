@@ -33,3 +33,11 @@
 
 ## Phase 6: Future work
 - Not started.
+
+## Phase 7G: PayPal checkout reliability
+- [x] Durable, proposal-unique order attempts bound to owner, consent, amount and currency.
+- [x] Stable provider request idempotency and explicit ambiguous-order recovery.
+- [x] Capture reservation, provider lookup reconciliation, and backend-verified return flow.
+- [x] Authenticated frontend checkout, cancellation, pending and confirmed-settlement states.
+- [ ] Confirm Sandbox idempotency retention, build automated reconciliation and alerting, and provide a reviewed least-privilege operator recovery path.
+- Manual reconciliation procedure: see [Payment Operations](PAYMENT_OPERATIONS.md). Unresolved attempts require operator intervention; attempts past the six-hour key window without a stored provider order ID remain blocked because no supported local recovery endpoint can attach the discovered ID.

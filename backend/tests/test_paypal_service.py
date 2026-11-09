@@ -173,7 +173,7 @@ async def test_paypal_client_create_order_success() -> None:
                     "status": "CREATED",
                     "links": [
                         {
-                            "rel": "approve",
+                            "rel": "payer-action",
                             "href": "https://www.sandbox.paypal.com/checkoutnow?token=PAYPAL_ORDER_999",
                         }
                     ],

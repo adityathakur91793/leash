@@ -1,6 +1,6 @@
 # LEASH Database Schema
 
-## Current Schema (Phase 2B — Version 3)
+## Current Schema (Version 11)
 
 ### 1. `schema_version`
 Tracks database migration version history.
@@ -65,6 +65,20 @@ Migration 3 is additive: existing `mandates` rows and schema version 2 history
 are preserved. Foreign keys are enforced (`PRAGMA foreign_keys = ON`).
 
 ---
+
+### `paypal_order_attempts` (Migration 11)
+
+One durable row per proposal checkout attempt. Unique proposal and provider request
+IDs prevent independent attempts from racing. Each row binds owner, consent ID and
+binding hash, expected amount/currency, provider order ID, approval link, state,
+and timestamps. Migration 11 is additive; historical PayPal orders are preserved
+and are not backfilled as new attempts. Attempt rows are removed before their
+proposal rows in test cleanup; production history is retained.
+
+States are `PREPARED`, `REQUESTING`, `UNKNOWN`, `PROVIDER_CREATED`, `FAILED`, and
+`RECONCILIATION_REQUIRED`. `REQUESTING` and `UNKNOWN` are never treated as permission
+to create a new attempt. Recovery uses the same stored provider idempotency key or
+queries a known provider order ID.
 
 ## Planned Tables (Phase 2C+)
 

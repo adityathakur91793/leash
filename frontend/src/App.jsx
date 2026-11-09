@@ -9,6 +9,7 @@ import { useMandates } from './hooks/useMandates';
 import { useProposals } from './hooks/useProposals';
 import { useIntentAssessment } from './hooks/useIntentAssessment';
 import { ProposalInbox } from './components/ProposalInbox';
+import { CheckoutReturn } from './components/CheckoutReturn';
 import './App.css';
 
 function App() {
@@ -43,6 +44,10 @@ function App() {
       </header>
 
       <main className="app-main">
+        <CheckoutReturn
+          sessionToken={session.status === 'active' ? session.token : null}
+          onSessionExpired={session.markExpired}
+        />
         <section className={`session-panel session-${session.status}`} aria-labelledby="session-title">
           <div className="session-summary">
             {session.status === 'loading' ? <Loader className="session-icon spinning" size={20} />

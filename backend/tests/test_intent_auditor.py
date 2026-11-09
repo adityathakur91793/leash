@@ -365,15 +365,18 @@ class _PayPalOrderStub:
     def __init__(self) -> None:
         self.create_calls = 0
         self.get_calls = 0
+        self.proposal_id = None
 
     async def create_order(self, **kwargs):
         self.create_calls += 1
-        return {"order_id": "PAYPAL-ORDER-1", "approval_url": "https://paypal.test/approve",
+        self.proposal_id = kwargs["proposal"].proposal_id
+        return {"order_id": "PAYPAL-ORDER-1", "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=PAYPAL-ORDER-1",
                 "status": "CREATED"}
 
     async def get_order(self, order_id):
         self.get_calls += 1
-        return {"status": "APPROVED", "purchase_units": [{
+        return {"id": order_id, "status": "APPROVED", "purchase_units": [{
+            "reference_id": self.proposal_id,
             "amount": {"currency_code": "USD", "value": "10.00"}
         }]}
 

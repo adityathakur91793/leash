@@ -10,9 +10,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.dependencies import get_current_session
 from app.schemas.payment import (
+    PaymentCheckoutState,
     PaymentCaptureResponse,
     PaymentOrderCreateRequest,
     PaymentOrderResponse,
+    PaymentReturnRequest,
+    PaymentReturnResponse,
+    PaymentRecoveryResponse,
 )
 from app.schemas.session import UserSession
 from app.services.approval_service import MandateOwnershipError, OwnerlessMandateError
@@ -27,6 +31,9 @@ from app.services.payment_service import (
     capture_payment_order,
     create_payment_order,
     get_payment_order,
+    get_payment_checkout_state,
+    recover_proposal_checkout,
+    verify_payment_return,
 )
 from app.services.paypal_service import (
     PayPalAuthError,
@@ -41,6 +48,51 @@ from app.services.intent_auditor_client import IntentAuditorUnavailable
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Payments"])
+
+
+@router.get(
+    "/proposals/{proposal_id}/checkout",
+    response_model=PaymentCheckoutState,
+)
+async def get_checkout_state_endpoint(
+    proposal_id: str,
+    session: UserSession = Depends(get_current_session),
+) -> PaymentCheckoutState:
+    """Return only persisted checkout state for the authenticated proposal owner."""
+    try:
+        return await get_payment_checkout_state(proposal_id, session.user_id)
+    except Exception as exc:
+        raise _handle_payment_exceptions(exc) from exc
+
+
+@router.post(
+    "/payments/return",
+    response_model=PaymentReturnResponse,
+)
+async def verify_payment_return_endpoint(
+    body: PaymentReturnRequest,
+    session: UserSession = Depends(get_current_session),
+) -> PaymentReturnResponse:
+    """Verify browser return IDs against the authenticated local order and PayPal."""
+    try:
+        return await verify_payment_return(body.proposal_id, body.order_id, session.user_id)
+    except Exception as exc:
+        raise _handle_payment_exceptions(exc) from exc
+
+
+@router.post(
+    "/proposals/{proposal_id}/checkout/reconcile",
+    response_model=PaymentRecoveryResponse,
+)
+async def reconcile_proposal_checkout_endpoint(
+    proposal_id: str,
+    session: UserSession = Depends(get_current_session),
+) -> PaymentRecoveryResponse:
+    """Verify persisted provider state for the authenticated proposal owner."""
+    try:
+        return await recover_proposal_checkout(proposal_id, session.user_id)
+    except Exception as exc:
+        raise _handle_payment_exceptions(exc) from exc
 
 
 def _handle_payment_exceptions(exc: Exception) -> HTTPException:

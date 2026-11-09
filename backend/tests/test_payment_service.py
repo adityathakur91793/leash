@@ -19,8 +19,11 @@ def _capture_response(
     amount: str = "16.00", currency: str = "USD", capture_id: str = "CAP-1",
 ) -> dict[str, object]:
     return {
+        "id": "order",
         "status": status,
         "purchase_units": [{
+            "reference_id": "proposal",
+            "amount": {"value": amount, "currency_code": currency},
             "payments": {"captures": [{
                 "id": capture_id,
                 "status": capture_status,
@@ -96,8 +99,9 @@ async def test_ambiguous_capture_is_reconciled_without_blind_retry(monkeypatch) 
         async def get_order(self, order_id):
             self.reconcile_calls += 1
             return {
+                "id": order_id,
                 "status": "APPROVED",
-                "purchase_units": [{"amount": {"currency_code": "USD", "value": "16.00"}}],
+                "purchase_units": [{"reference_id": "proposal", "amount": {"currency_code": "USD", "value": "16.00"}}],
             }
 
         async def capture_order(self, order_id, capture_request_id):
@@ -109,7 +113,10 @@ async def test_ambiguous_capture_is_reconciled_without_blind_retry(monkeypatch) 
         await service.capture_payment_order("order", "owner", paypal_client=client)
     assert client.capture_calls == 1
     assert client.reconcile_calls == 2  # initial approval check plus timeout reconciliation
-    assert statuses == [PayPalOrderStatus.RECONCILIATION_REQUIRED]
+    assert statuses == [
+        PayPalOrderStatus.CAPTURING,
+        PayPalOrderStatus.RECONCILIATION_REQUIRED,
+    ]
 
     # Subsequent and repeated ordinary requests must stop before contacting PayPal.
     for _ in range(3):
@@ -154,7 +161,7 @@ async def test_reconciliation_required_rejects_concurrent_capture_requests(monke
 
         async def get_order(self, order_id):
             self.get_order_calls += 1
-            return {"status": "APPROVED"}
+            return {"id": order_id, "status": "APPROVED"}
 
         async def capture_order(self, order_id, capture_request_id):
             self.capture_calls += 1
@@ -241,11 +248,16 @@ async def test_ambiguous_capture_reconciles_only_verified_completed_evidence(
             return None
 
     monkeypatch.setattr(service, "get_connection", Connection)
+    async def update_status(order_id, status, updated_at_iso, **kwargs):
+        order.status = status
+        return True
+
+    monkeypatch.setattr(service, "update_paypal_order_status_in_db", update_status)
     update_calls: list[str] = []
 
-    async def update_order(**kwargs):
+    async def update_order(*args, **kwargs):
         update_calls.append("order")
-        return kwargs["capture_id"] == "REAL-PAYPAL-CAPTURE-7"
+        return args[1] == "REAL-PAYPAL-CAPTURE-7"
 
     async def update_proposal(**kwargs):
         update_calls.append("proposal")
@@ -266,8 +278,10 @@ async def test_ambiguous_capture_reconciles_only_verified_completed_evidence(
             self.get_order_calls += 1
             if self.get_order_calls == 1:
                 return {
+                    "id": order_id,
                     "status": "APPROVED",
                     "purchase_units": [{
+                        "reference_id": "proposal",
                         "amount": {"currency_code": "USD", "value": "16.00"}
                     }],
                 }
@@ -284,7 +298,7 @@ async def test_ambiguous_capture_reconciles_only_verified_completed_evidence(
     assert result.capture_id == "REAL-PAYPAL-CAPTURE-7"
     assert client.capture_calls == 1
     assert client.get_order_calls == 2
-    assert update_calls == ["order", "proposal", "audit"]
+    assert update_calls == ["audit", "order", "proposal", "audit"]
 
 
 @pytest.mark.asyncio
@@ -321,12 +335,18 @@ async def test_capture_finalization_stops_if_order_update_loses_race(monkeypatch
     async def update_order(*args, **kwargs):
         return False
 
+    async def update_status(order_id, status, updated_at_iso, **kwargs):
+        order.status = status
+        return True
+
     async def update_proposal(*args, **kwargs):
         proposal_updates.append(True)
         return True
 
     monkeypatch.setattr(service, "update_paypal_order_captured_in_db", update_order)
+    monkeypatch.setattr(service, "update_paypal_order_status_in_db", update_status)
     monkeypatch.setattr(service, "update_proposal_status_in_db", update_proposal)
+    monkeypatch.setattr(service.AuditService, "append_event", _async_value(None))
 
     class Connection:
         committed = False
@@ -353,8 +373,9 @@ async def test_capture_finalization_stops_if_order_update_loses_race(monkeypatch
     class Client:
         async def get_order(self, order_id):
             return {
+                "id": order_id,
                 "status": "APPROVED",
-                "purchase_units": [{"amount": {"currency_code": "USD", "value": "16.00"}}],
+                "purchase_units": [{"reference_id": "proposal", "amount": {"currency_code": "USD", "value": "16.00"}}],
             }
 
         async def capture_order(self, order_id, capture_request_id):
@@ -367,7 +388,7 @@ async def test_capture_finalization_stops_if_order_update_loses_race(monkeypatch
         await service.capture_payment_order("order", "owner", paypal_client=Client())
     assert proposal_updates == []
     assert connection.rolled_back is True
-    assert connection.committed is False
+    assert connection.committed is True
 
 
 def _async_value(value):

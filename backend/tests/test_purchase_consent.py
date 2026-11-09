@@ -11,20 +11,26 @@ import pytest
 
 from app.db.database import (
     get_connection,
+    get_paypal_order_from_db,
     get_proposal_from_db,
     insert_paypal_order_in_db,
     list_audit_log_entries,
 )
-from app.schemas.audit import AuditEventType
+from app.schemas.audit import AuditActor, AuditEntityType, AuditEventType
 from app.schemas.mandate import MandateCreate
 from app.schemas.payment import PayPalOrderRecord, PayPalOrderStatus
 from app.schemas.policy import DecisionOutcome
 from app.schemas.proposal import ProposalCreate, ProposalStatus
 from app.core.config import settings
 from app.services.intent_auditor_client import IntentAuditorUnavailable
-from app.services.approval_service import consume_approval_token, issue_approval_token
+from app.services.approval_service import (
+    MandateOwnershipError,
+    consume_approval_token,
+    issue_approval_token,
+)
 from app.services.audit_service import AuditService
 from app.services.mandate_service import (
+    MandateExpiredError,
     activate_mandate,
     confirm_mandate,
     create_draft_mandate,
@@ -36,7 +42,11 @@ from app.services.proposal_service import (
     create_proposal,
     evaluate_proposal_service,
 )
-from app.services.payment_service import capture_payment_order, create_payment_order
+from app.services.payment_service import (
+    capture_payment_order, create_payment_order, recover_proposal_checkout,
+    verify_payment_return,
+)
+from app.services.paypal_service import PayPalNetworkError, PayPalOrderError
 from app.services.purchase_consent_service import (
     PurchaseConsentDeniedError,
     PurchaseConsentRequiredError,
@@ -526,7 +536,7 @@ async def test_assessment_change_invalidates_consent_for_order_and_capture() -> 
 
         async def get_order(self, order_id):
             self.get_calls += 1
-            return {"status": "APPROVED", "purchase_units": []}
+            return {"id": order_id, "status": "APPROVED", "purchase_units": []}
 
     owner = "assessment-order-owner"
     proposal_id = await _proposal(owner, allow=True)
@@ -549,6 +559,772 @@ async def test_assessment_change_invalidates_consent_for_order_and_capture() -> 
             "assessment-bound-order", owner, paypal_client=paypal
         )
     assert paypal.get_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_order_creation_reuses_durable_provider_idempotency_key() -> None:
+    owner = "ambiguous-order-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        request_ids = []
+        calls = 0
+
+        async def create_order(self, **kwargs):
+            self.calls += 1
+            self.request_ids.append(kwargs["paypal_request_id"])
+            if self.calls == 1:
+                raise PayPalNetworkError("simulated provider timeout")
+            return {
+                "order_id": "recovered-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=recovered-order",
+                "status": "CREATED",
+            }
+
+    paypal = PayPal()
+    with pytest.raises(PayPalNetworkError):
+        await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    async with get_connection() as db:
+        row = await (await db.execute(
+            "SELECT attempt_id, status, provider_request_id FROM paypal_order_attempts "
+            "WHERE proposal_id = ?", (proposal_id,),
+        )).fetchone()
+        assert row[1] == "UNKNOWN"
+    response = await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    assert response.order_id == "recovered-order"
+    assert paypal.calls == 2
+    assert paypal.request_ids[0] == paypal.request_ids[1] == row[2]
+    async with get_connection() as db:
+        attempts = await (await db.execute(
+            "SELECT COUNT(*) FROM paypal_order_attempts WHERE proposal_id = ?", (proposal_id,),
+        )).fetchone()
+        stored = await (await db.execute(
+            "SELECT status, provider_order_id FROM paypal_order_attempts WHERE proposal_id = ?",
+            (proposal_id,),
+        )).fetchone()
+        assert attempts[0] == 1
+        assert stored == ("PROVIDER_CREATED", "recovered-order")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_order_request_does_not_dispatch_provider_twice() -> None:
+    owner = "concurrent-order-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    class PayPal:
+        calls = 0
+
+        async def create_order(self, **kwargs):
+            self.calls += 1
+            provider_started.set()
+            await release_provider.wait()
+            return {
+                "order_id": "single-dispatched-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+    paypal = PayPal()
+    first = asyncio.create_task(create_payment_order(proposal_id, owner, paypal_client=paypal))
+    await provider_started.wait()
+    with pytest.raises(PayPalOrderError, match="already in progress"):
+        await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    release_provider.set()
+    result = await first
+    assert result.order_id == "single-dispatched-order"
+    assert paypal.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_of_anchored_order_never_creates_another_order() -> None:
+    owner = "anchored-order-recovery-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class LostResponse:
+        async def create_order(self, **kwargs):
+            raise PayPalNetworkError("response lost after provider creation")
+
+    with pytest.raises(PayPalNetworkError):
+        await create_payment_order(proposal_id, owner, paypal_client=LostResponse())
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE paypal_order_attempts SET provider_order_id=?, approval_url=? "
+            "WHERE proposal_id=?",
+            ("already-created-provider-order",
+             "https://www.sandbox.paypal.com/checkoutnow?token=opaque", proposal_id),
+        )
+        await db.commit()
+
+    both_lookups_started = asyncio.Event()
+    release_lookups = asyncio.Event()
+
+    class RecoveryPayPal:
+        get_calls = 0
+        create_calls = 0
+
+        async def get_order(self, order_id):
+            self.get_calls += 1
+            if self.get_calls == 2:
+                both_lookups_started.set()
+            await release_lookups.wait()
+            return {
+                "id": order_id, "status": "APPROVED", "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }],
+            }
+
+        async def create_order(self, **kwargs):
+            self.create_calls += 1
+            raise AssertionError("Recovery must look up the persisted provider order ID.")
+
+    recovery = RecoveryPayPal()
+    first = asyncio.create_task(create_payment_order(
+        proposal_id, owner, paypal_client=recovery,
+    ))
+    second = asyncio.create_task(create_payment_order(
+        proposal_id, owner, paypal_client=recovery,
+    ))
+    await both_lookups_started.wait()
+    release_lookups.set()
+    responses = await asyncio.gather(first, second)
+    assert [response.order_id for response in responses] == [
+        "already-created-provider-order", "already-created-provider-order",
+    ]
+    assert recovery.create_calls == 0
+    async with get_connection() as db:
+        rows = await (await db.execute(
+            "SELECT order_id FROM paypal_orders WHERE proposal_id=?", (proposal_id,),
+        )).fetchall()
+    assert rows == [("already-created-provider-order",)]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_order_attempt_refuses_replay_after_provider_key_window() -> None:
+    owner = "expired-order-key-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        calls = 0
+
+        async def create_order(self, **kwargs):
+            self.calls += 1
+            raise PayPalNetworkError("simulated provider timeout")
+
+    paypal = PayPal()
+    with pytest.raises(PayPalNetworkError):
+        await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE paypal_order_attempts SET created_at = ? WHERE proposal_id = ?",
+            ((datetime.now(timezone.utc) - timedelta(hours=7)).isoformat(), proposal_id),
+        )
+        await db.commit()
+    with pytest.raises(PayPalOrderError, match="idempotency recovery window expired"):
+        await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    assert paypal.calls == 1
+    async with get_connection() as db:
+        row = await (await db.execute(
+            "SELECT status FROM paypal_order_attempts WHERE proposal_id = ?", (proposal_id,),
+        )).fetchone()
+        assert row == ("RECONCILIATION_REQUIRED",)
+
+
+@pytest.mark.asyncio
+async def test_verified_completed_provider_order_recovers_uncertain_capture() -> None:
+    owner = "verified-capture-recovery-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        async def create_order(self, **kwargs):
+            return {
+                "order_id": "completed-after-timeout-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+        async def get_order(self, order_id):
+            assert order_id == "completed-after-timeout-order"
+            return {
+                "id": order_id,
+                "status": "COMPLETED",
+                "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                    "payments": {"captures": [{
+                        "id": "provider-confirmed-capture",
+                        "status": "COMPLETED",
+                        "amount": {"currency_code": "USD", "value": "10.00"},
+                    }]},
+                }],
+            }
+
+        async def capture_order(self, *args, **kwargs):
+            raise AssertionError("A completed provider capture must not be dispatched again.")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE paypal_orders SET status='RECONCILIATION_REQUIRED' "
+            "WHERE order_id='completed-after-timeout-order'"
+        )
+        await db.commit()
+
+    result = await verify_payment_return(
+        proposal_id, "completed-after-timeout-order", owner, paypal_client=paypal
+    )
+    assert result.payment_completed is True
+    assert result.status == PayPalOrderStatus.COMPLETED
+    async with get_connection() as db:
+        row = await (await db.execute(
+            "SELECT status, capture_id FROM paypal_orders WHERE order_id = ?",
+            ("completed-after-timeout-order",),
+        )).fetchone()
+        proposal = await get_proposal_from_db(proposal_id, db=db)
+    assert row == ("COMPLETED", "provider-confirmed-capture")
+    assert proposal is not None and proposal.status == ProposalStatus.SETTLED
+
+
+@pytest.mark.asyncio
+async def test_completed_status_without_capture_id_is_not_reported_as_success() -> None:
+    from app.services.payment_service import get_payment_checkout_state
+
+    owner = "missing-capture-id-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        async def create_order(self, **kwargs):
+            return {
+                "order_id": "missing-capture-id-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+    await create_payment_order(proposal_id, owner, paypal_client=PayPal())
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE paypal_orders SET status='COMPLETED', capture_id=NULL "
+            "WHERE order_id=?", ("missing-capture-id-order",),
+        )
+        await db.execute(
+            "UPDATE mandates SET expires_at=? WHERE owner_user_id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), owner),
+        )
+        await db.commit()
+    state = await get_payment_checkout_state(proposal_id, owner)
+    assert state.status == PayPalOrderStatus.RECONCILIATION_REQUIRED
+    assert state.payment_status == PayPalOrderStatus.RECONCILIATION_REQUIRED
+    assert state.consent_recorded is False
+    assert state.order_id is None
+    assert state.approval_url is None
+    assert state.recovery_available is True
+
+
+@pytest.mark.asyncio
+async def test_expired_authorization_blocks_new_capture_but_records_verified_completion() -> None:
+    owner = "expired-auth-capture-recovery-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        get_calls = 0
+        capture_calls = 0
+        create_calls = 0
+
+        async def create_order(self, **kwargs):
+            self.create_calls += 1
+            return {
+                "order_id": "expired-auth-recovery-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+        async def get_order(self, order_id):
+            self.get_calls += 1
+            return {
+                "id": order_id, "status": "COMPLETED", "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                    "payments": {"captures": [{
+                        "id": "verified-after-expiry-capture", "status": "COMPLETED",
+                        "amount": {"currency_code": "USD", "value": "10.00"},
+                    }]},
+                }],
+            }
+
+        async def capture_order(self, *args, **kwargs):
+            self.capture_calls += 1
+            raise AssertionError("Reconciliation must not dispatch a new capture.")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    proposal = await get_proposal_from_db(proposal_id)
+    assert proposal is not None
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE mandates SET expires_at=? WHERE mandate_id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+             proposal.mandate_id),
+        )
+        await db.commit()
+
+    with pytest.raises(MandateExpiredError, match="expired"):
+        await capture_payment_order(
+            "expired-auth-recovery-order", owner, paypal_client=paypal,
+        )
+    assert paypal.get_calls == 0
+    assert paypal.capture_calls == 0
+
+    result = await verify_payment_return(
+        proposal_id, "expired-auth-recovery-order", owner, paypal_client=paypal,
+    )
+    assert result.payment_completed is True
+    assert paypal.get_calls == 1
+    assert paypal.capture_calls == 0
+    async with get_connection() as db:
+        order = await (await db.execute(
+            "SELECT status, capture_id FROM paypal_orders WHERE order_id=?",
+            ("expired-auth-recovery-order",),
+        )).fetchone()
+        settled = await get_proposal_from_db(proposal_id, db=db)
+    assert order == ("COMPLETED", "verified-after-expiry-capture")
+    assert settled is not None and settled.status == ProposalStatus.SETTLED
+    async with get_connection() as db:
+        await db.execute(
+            "DELETE FROM paypal_orders WHERE order_id=?",
+            ("expired-auth-recovery-order",),
+        )
+        await db.commit()
+    recovered = await create_payment_order(
+        proposal_id, owner, paypal_client=paypal,
+    )
+    assert recovered.status == PayPalOrderStatus.COMPLETED
+    assert paypal.get_calls == 2
+    assert paypal.capture_calls == 0
+    assert paypal.create_calls == 1
+    async with get_connection() as db:
+        recovered_order = await (await db.execute(
+            "SELECT status, capture_id FROM paypal_orders WHERE order_id=?",
+            ("expired-auth-recovery-order",),
+        )).fetchone()
+    assert recovered_order == ("COMPLETED", "verified-after-expiry-capture")
+
+
+@pytest.mark.asyncio
+async def test_login_after_expired_return_resumes_owner_scoped_factual_recovery(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reload/login uses proposal scope and never needs browser-supplied order IDs."""
+    from app.api.v1 import payments as payments_api
+
+    old_headers, owner = await _auth(client)
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        capture_calls = 0
+
+        async def create_order(self, **kwargs):
+            return {
+                "order_id": "reload-recovery-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+        async def get_order(self, order_id):
+            assert order_id == "reload-recovery-order"
+            return {
+                "id": order_id, "status": "COMPLETED", "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                    "payments": {"captures": [{
+                        "id": "reload-real-capture", "status": "COMPLETED",
+                        "amount": {"currency_code": "USD", "value": "10.00"},
+                    }]},
+                }],
+            }
+
+        async def capture_order(self, *args, **kwargs):
+            self.capture_calls += 1
+            raise AssertionError("Factual recovery must never dispatch capture.")
+
+    paypal = PayPal()
+    async def recover_for_test(proposal_id: str, principal_id: str):
+        return await recover_proposal_checkout(
+            proposal_id, principal_id, paypal_client=paypal,
+        )
+
+    monkeypatch.setattr(payments_api, "recover_proposal_checkout", recover_for_test)
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    proposal = await get_proposal_from_db(proposal_id)
+    assert proposal is not None
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE mandates SET expires_at=? WHERE mandate_id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+             proposal.mandate_id),
+        )
+        await db.commit()
+
+    # Renew a session for the same server-derived principal, then expire the
+    # original return session to model login after browser reload.
+    renewed = await client.post("/api/v1/sessions", json={}, headers=old_headers)
+    assert renewed.status_code == 201
+    renewed_headers = {"Authorization": f"Bearer {renewed.json()['session_token']}"}
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE user_sessions SET expires_at=? WHERE session_token_hash=("
+            "SELECT session_token_hash FROM user_sessions WHERE user_id=? "
+            "ORDER BY created_at LIMIT 1)",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), owner),
+        )
+        await db.commit()
+
+    state = await client.get(
+        f"/api/v1/proposals/{proposal_id}/checkout", headers=renewed_headers,
+    )
+    assert state.status_code == 200
+    assert state.json()["recovery_available"] is True
+    assert state.json()["order_id"] is None
+    assert state.json()["approval_url"] is None
+    recovered = await client.post(
+        f"/api/v1/proposals/{proposal_id}/checkout/reconcile",
+        headers=renewed_headers,
+    )
+    assert recovered.status_code == 200
+    assert recovered.json() == {
+        "proposal_id": proposal_id, "status": "COMPLETED",
+        "provider_status": "COMPLETED", "payment_completed": True,
+    }
+    assert "reload-recovery-order" not in recovered.text
+    assert paypal.capture_calls == 0
+    async with get_connection() as db:
+        row = await (await db.execute(
+            "SELECT status, capture_id FROM paypal_orders WHERE order_id=?",
+            ("reload-recovery-order",),
+        )).fetchone()
+    assert row == ("COMPLETED", "reload-real-capture")
+
+
+@pytest.mark.asyncio
+async def test_recovery_of_existing_order_does_not_claim_noncompleted_payment() -> None:
+    proposal_id = await _proposal("not-completed-recovery-owner", allow=True)
+    owner = "not-completed-recovery-owner"
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        capture_calls = 0
+
+        async def create_order(self, **kwargs):
+            return {"order_id": "not-completed-order",
+                    "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=x",
+                    "status": "CREATED"}
+
+        async def get_order(self, order_id):
+            return {"id": order_id, "status": "APPROVED", "purchase_units": [{
+                "reference_id": proposal_id,
+                "amount": {"currency_code": "USD", "value": "10.00"},
+            }]}
+
+        async def capture_order(self, *args, **kwargs):
+            self.capture_calls += 1
+            raise AssertionError("Recovery may not capture.")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    result = await recover_proposal_checkout(proposal_id, owner, paypal_client=paypal)
+    assert result.payment_completed is False
+    assert result.provider_status == "APPROVED"
+    assert result.status == PayPalOrderStatus.CREATED
+    assert paypal.capture_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_loads_provider_order_id_from_attempt_when_local_order_is_missing() -> None:
+    proposal_id = await _proposal("attempt-only-recovery-owner", allow=True)
+    owner = "attempt-only-recovery-owner"
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        create_calls = 0
+        capture_calls = 0
+
+        async def create_order(self, **kwargs):
+            self.create_calls += 1
+            return {"order_id": "attempt-only-provider-order",
+                    "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=x",
+                    "status": "CREATED"}
+
+        async def get_order(self, order_id):
+            assert order_id == "attempt-only-provider-order"
+            return {"id": order_id, "status": "COMPLETED", "purchase_units": [{
+                "reference_id": proposal_id,
+                "amount": {"currency_code": "USD", "value": "10.00"},
+                "payments": {"captures": [{
+                    "id": "attempt-only-real-capture", "status": "COMPLETED",
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }]},
+            }]}
+
+        async def capture_order(self, *args, **kwargs):
+            self.capture_calls += 1
+            raise AssertionError("Recovery must not initiate capture.")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    async with get_connection() as db:
+        await db.execute("DELETE FROM paypal_orders WHERE proposal_id=?", (proposal_id,))
+        await db.commit()
+    result = await recover_proposal_checkout(proposal_id, owner, paypal_client=paypal)
+    assert result.payment_completed is True
+    assert paypal.create_calls == 1
+    assert paypal.capture_calls == 0
+    async with get_connection() as db:
+        row = await (await db.execute(
+            "SELECT status, capture_id FROM paypal_orders WHERE proposal_id=?", (proposal_id,),
+        )).fetchone()
+    assert row == ("COMPLETED", "attempt-only-real-capture")
+
+
+@pytest.mark.asyncio
+async def test_recovery_keeps_unavailable_and_ambiguous_provider_results_fail_closed() -> None:
+    proposal_id = await _proposal("ambiguous-recovery-owner", allow=True)
+    owner = "ambiguous-recovery-owner"
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        async def create_order(self, **kwargs):
+            return {"order_id": "ambiguous-recovery-order",
+                    "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=x",
+                    "status": "CREATED"}
+
+    await create_payment_order(proposal_id, owner, paypal_client=PayPal())
+
+    class AmbiguousPayPal:
+        async def get_order(self, order_id):
+            return {"id": order_id, "status": "PENDING", "purchase_units": []}
+
+    ambiguous = await recover_proposal_checkout(
+        proposal_id, owner, paypal_client=AmbiguousPayPal(),
+    )
+    assert ambiguous.payment_completed is False
+    assert ambiguous.status == PayPalOrderStatus.RECONCILIATION_REQUIRED
+    assert ambiguous.provider_status is None
+
+    class MismatchedPayPal:
+        async def get_order(self, order_id):
+            return {"id": order_id, "status": "COMPLETED", "purchase_units": [{
+                "reference_id": "different-proposal",
+                "amount": {"currency_code": "USD", "value": "10.00"},
+                "payments": {"captures": [{
+                    "id": "unbound-capture", "status": "COMPLETED",
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }]},
+            }]}
+
+    mismatch = await recover_proposal_checkout(
+        proposal_id, owner, paypal_client=MismatchedPayPal(),
+    )
+    assert mismatch.payment_completed is False
+    assert mismatch.status == PayPalOrderStatus.RECONCILIATION_REQUIRED
+    assert mismatch.provider_status == "COMPLETED"
+
+    class UnavailablePayPal:
+        async def get_order(self, order_id):
+            raise PayPalNetworkError("simulated provider timeout")
+
+    with pytest.raises(PayPalNetworkError):
+        await recover_proposal_checkout(proposal_id, owner, paypal_client=UnavailablePayPal())
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_foreign_owner_and_concurrent_retries_settle_once() -> None:
+    proposal_id = await _proposal("concurrent-recovery-owner", allow=True)
+    owner = "concurrent-recovery-owner"
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        capture_calls = 0
+        create_calls = 0
+        calls = 0
+        both_lookups = asyncio.Event()
+
+        async def create_order(self, **kwargs):
+            self.create_calls += 1
+            return {"order_id": "concurrent-recovery-order",
+                    "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=x",
+                    "status": "CREATED"}
+
+        async def get_order(self, order_id):
+            self.calls += 1
+            if self.calls == 2:
+                self.both_lookups.set()
+            await asyncio.wait_for(self.both_lookups.wait(), timeout=2)
+            return {"id": order_id, "status": "COMPLETED", "purchase_units": [{
+                "reference_id": proposal_id,
+                "amount": {"currency_code": "USD", "value": "10.00"},
+                "payments": {"captures": [{
+                    "id": "concurrent-real-capture", "status": "COMPLETED",
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }]},
+            }]}
+
+        async def capture_order(self, *args, **kwargs):
+            self.capture_calls += 1
+            raise AssertionError("Recovery must not initiate capture.")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    with pytest.raises(MandateOwnershipError):
+        await recover_proposal_checkout(proposal_id, "foreign-owner", paypal_client=paypal)
+    results = await asyncio.gather(*[
+        recover_proposal_checkout(proposal_id, owner, paypal_client=paypal)
+        for _ in range(2)
+    ])
+    assert all(result.payment_completed for result in results)
+    assert paypal.capture_calls == 0
+    assert paypal.create_calls == 1
+    duplicate = await recover_proposal_checkout(proposal_id, owner, paypal_client=paypal)
+    assert duplicate.payment_completed is True
+    assert paypal.capture_calls == 0
+    assert paypal.create_calls == 1
+    events, _ = await list_audit_log_entries(limit=200)
+    capture_events = [event for event in events
+                      if event.event_type == AuditEventType.PAYMENT_CAPTURED]
+    assert len(capture_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_timeout_losing_to_completed_settlement_adds_no_failure_event() -> None:
+    from app.db.database import update_paypal_order_captured_in_db, update_proposal_status_in_db
+
+    owner = "capture-timeout-completion-race-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        get_calls = 0
+
+        async def create_order(self, **kwargs):
+            return {
+                "order_id": "capture-timeout-race-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+        async def get_order(self, order_id):
+            self.get_calls += 1
+            return {
+                "id": order_id, "status": "APPROVED", "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }],
+            }
+
+        async def capture_order(self, order_id, capture_request_id):
+            # Deterministically model a concurrent verifier persisting the real
+            # provider completion before this request observes its timeout.
+            async with get_connection() as db:
+                await db.execute("BEGIN IMMEDIATE")
+                await update_paypal_order_captured_in_db(
+                    order_id, "race-winner-capture", capture_request_id,
+                    datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(),
+                    db=db,
+                )
+                proposal = await get_proposal_from_db(proposal_id, db=db)
+                assert proposal is not None
+                await update_proposal_status_in_db(
+                    proposal_id, ProposalStatus.SETTLED,
+                    expected_current_status=proposal.status, db=db,
+                )
+                await AuditService.append_event(
+                    event_type=AuditEventType.PAYMENT_CAPTURED,
+                    entity_type=AuditEntityType.PAYMENT, entity_id=order_id,
+                    actor=AuditActor.SYSTEM,
+                    payload={"order_id": order_id, "capture_id": "race-winner-capture",
+                             "proposal_id": proposal_id, "total": "10.00",
+                             "currency": "USD"}, db=db,
+                )
+                await db.commit()
+            raise PayPalNetworkError("simulated stale timeout after concurrent completion")
+
+    paypal = PayPal()
+    await create_payment_order(proposal_id, owner, paypal_client=paypal)
+    result = await capture_payment_order(
+        "capture-timeout-race-order", owner, paypal_client=paypal,
+    )
+    assert result.status == PayPalOrderStatus.COMPLETED
+    assert result.capture_id == "race-winner-capture"
+    async with get_connection() as db:
+        events = [row[0] for row in await (await db.execute(
+            "SELECT event_type FROM audit_logs WHERE entity_id=? ORDER BY sequence_number",
+            ("capture-timeout-race-order",),
+        )).fetchall()]
+    assert events.count("PAYMENT_CAPTURE_ATTEMPTED") == 1
+    assert events.count("PAYMENT_CAPTURED") == 1
+    assert "PAYMENT_FAILED" not in events
+
+
+@pytest.mark.asyncio
+async def test_stale_return_snapshot_cannot_reopen_capture_reservation(monkeypatch) -> None:
+    from app.services import payment_service
+
+    owner = "stale-return-capture-owner"
+    proposal_id = await _proposal(owner, allow=True)
+    await record_purchase_consent(proposal_id, owner)
+
+    class PayPal:
+        async def create_order(self, **kwargs):
+            return {
+                "order_id": "return-race-order",
+                "approval_url": "https://www.sandbox.paypal.com/checkoutnow?token=opaque",
+                "status": "CREATED",
+            }
+
+        async def get_order(self, order_id):
+            return {
+                "id": order_id, "status": "APPROVED", "purchase_units": [{
+                    "reference_id": proposal_id,
+                    "amount": {"currency_code": "USD", "value": "10.00"},
+                }],
+            }
+
+    await create_payment_order(proposal_id, owner, paypal_client=PayPal())
+    order = await get_paypal_order_from_db("return-race-order")
+    assert order is not None
+    async with get_connection() as db:
+        await db.execute(
+            "UPDATE paypal_orders SET status='CAPTURING' WHERE order_id=?",
+            ("return-race-order",),
+        )
+        await db.commit()
+
+    original_get_order = payment_service.get_paypal_order_from_db
+
+    async def stale_initial_read(order_id, db=None):
+        if db is None:
+            return order.model_copy(update={"status": PayPalOrderStatus.CREATED})
+        return await original_get_order(order_id, db=db)
+
+    monkeypatch.setattr(payment_service, "get_paypal_order_from_db", stale_initial_read)
+    result = await verify_payment_return(
+        proposal_id, "return-race-order", owner, paypal_client=PayPal()
+    )
+    assert result.status == PayPalOrderStatus.CAPTURING
+    async with get_connection() as db:
+        status = await (await db.execute(
+            "SELECT status FROM paypal_orders WHERE order_id=?", ("return-race-order",),
+        )).fetchone()
+    assert status == ("CAPTURING",)
 
 
 @pytest.mark.parametrize(
@@ -787,7 +1563,7 @@ async def test_changed_policy_and_legacy_approved_without_consent_fail_closed(
 
 @pytest.mark.asyncio
 async def test_real_v8_database_upgrades_without_backfill(monkeypatch, tmp_path) -> None:
-    """Build an actual v8 schema, then run the real v9/v10 migration path."""
+    """Build an actual v8 schema, then run the real v9-v11 migration path."""
     from app.db.database import init_db, get_paypal_order_from_db
 
     database_path = tmp_path / "legacy-v8.db"
@@ -917,7 +1693,13 @@ async def test_real_v8_database_upgrades_without_backfill(monkeypatch, tmp_path)
         db.row_factory = aiosqlite.Row
         assert (await (await db.execute(
             "SELECT MAX(version) FROM schema_version"
-        )).fetchone())[0] == 10
+        )).fetchone())[0] == 11
+        assert await (await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paypal_order_attempts'"
+        )).fetchone() is not None
+        assert (await (await db.execute(
+            "SELECT COUNT(*) FROM paypal_order_attempts"
+        )).fetchone())[0] == 0
         token_columns = {row["name"] for row in await (await db.execute(
             "PRAGMA table_info(approval_tokens)"
         )).fetchall()}

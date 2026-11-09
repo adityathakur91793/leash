@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Loader, RefreshCw, ShieldAlert, ClipboardList } from 'lucide-react';
 import { ApprovalConsentPanel } from './ApprovalConsentPanel';
+import { PayPalCheckout } from './PayPalCheckout';
 
 const money = (amount, currency) => `${currency || 'Currency unavailable'} ${amount ?? 'Amount unavailable'}`;
 const time = (value) => value ? new Date(value).toLocaleString() : 'Time unavailable';
@@ -92,7 +93,14 @@ export function ProposalInbox({ proposals, sessionToken, sessionIdentity, onSess
               proposalId: detail.proposal_id, status: result.status,
             })}
           />
-          <p className="immutability-note"><AlertTriangle size={14}/> Purchase consent records your choice with LEASH. Payment is a separate future step.</p>
+          <PayPalCheckout
+            key={`checkout:${detail.proposal_id}:${visibleSelectionRevision}`}
+            proposalId={detail.proposal_id}
+            consent={confirmedConsent?.proposalId === detail.proposal_id ? confirmedConsent : null}
+            sessionToken={sessionToken}
+            onSessionExpired={onSessionExpired}
+          />
+          <p className="immutability-note"><AlertTriangle size={14}/> Purchase consent records your choice with LEASH. PayPal checkout and buyer approval happen separately; payment is complete only after LEASH verifies settlement with PayPal.</p>
         </>}
       </section>
     </div>

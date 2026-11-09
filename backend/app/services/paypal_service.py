@@ -141,10 +141,13 @@ class PayPalClient:
         self._token_expires_at = now + timedelta(seconds=int(expires_in))
         return self._cached_token
 
-    def _validate_approval_url(self, url: str) -> str:
+    @staticmethod
+    def _validate_approval_url(url: str) -> str:
         """Ensure approval URL targets the expected PayPal Sandbox domain."""
         parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username:
+        if (parsed.scheme != "https" or parsed.port not in (None, 443)
+                or parsed.username is not None or parsed.password is not None
+                or parsed.fragment):
             raise PayPalOrderError(f"Insecure PayPal approval URL scheme '{parsed.scheme}'.")
         if parsed.hostname not in ALLOWED_APPROVAL_HOSTS:
             raise PayPalOrderError(
@@ -252,10 +255,11 @@ class PayPalClient:
         if not order_id:
             raise PayPalOrderError("PayPal order response missing order ID.")
 
-        # Find approval link
+        # Orders v2 uses `approve` for PayPal Checkout and `payer-action` for
+        # some supported payment/approval flows. Both remain host-validated.
         approve_url = None
         for link in data.get("links", []):
-            if link.get("rel") == "approve":
+            if link.get("rel") in {"approve", "payer-action"}:
                 approve_url = link.get("href")
                 break
 

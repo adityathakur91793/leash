@@ -177,6 +177,16 @@ describe('proposal inbox', () => {
     expect(screen.queryByText('hidden')).not.toBeInTheDocument();
   });
 
+  it('explains that consent, PayPal approval, and verified settlement are separate', async () => {
+    vi.spyOn(api, 'listProposals').mockResolvedValue([proposal]);
+    vi.spyOn(api, 'getProposal').mockResolvedValue(proposal);
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole('button', { name: /Unsafe/ }));
+    expect(await screen.findByText(/purchase consent records your choice/i)).toBeInTheDocument();
+    expect(screen.getByText(/payPal checkout and buyer approval happen separately/i)).toBeInTheDocument();
+    expect(screen.getByText(/payment is complete only after leash verifies settlement with paypal/i)).toBeInTheDocument();
+  });
+
   it('keeps policy outcome backend supplied and renders BLOCK as blocking', async () => {
     vi.spyOn(api, 'listProposals').mockResolvedValue([proposal]);
     vi.spyOn(api, 'getProposal').mockResolvedValue(proposal);
