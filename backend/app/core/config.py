@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     PAYPAL_MODE: str = "sandbox"
     PAYPAL_SANDBOX_BASE_URL: str = "https://api-m.sandbox.paypal.com"
 
+    # AI Provider configuration: "groq" (default) or "gemini".
+    AI_PROVIDER: str = "groq"
+
+    # Groq Shopping Agent configuration (backend-only).
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
+
     # Gemini Shopping Agent configuration. The key remains backend-only.
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
@@ -100,6 +107,28 @@ class Settings(BaseSettings):
             )
         return mode
 
+    @field_validator("AI_PROVIDER", mode="after")
+    @classmethod
+    def validate_ai_provider(cls, value: str) -> str:
+        """Allow only supported AI providers: 'groq' or 'gemini'."""
+        provider = value.strip().lower()
+        if provider not in {"groq", "gemini"}:
+            raise ValueError(
+                f"Invalid AI_PROVIDER '{value}'. Only 'groq' and 'gemini' are supported."
+            )
+        return provider
+
+    @field_validator("GROQ_MODEL", mode="after")
+    @classmethod
+    def validate_groq_model(cls, value: str) -> str:
+        """Keep the configurable Groq model identifier bounded and safe."""
+        import re
+
+        model = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,100}", model):
+            raise ValueError("GROQ_MODEL must be a valid model identifier.")
+        return model
+
     @field_validator("GEMINI_MODEL", mode="after")
     @classmethod
     def validate_gemini_model(cls, value: str) -> str:
@@ -110,6 +139,13 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", model):
             raise ValueError("GEMINI_MODEL must be a simple model identifier.")
         return model
+
+    @property
+    def active_ai_model(self) -> str:
+        """Return the active model name based on the configured AI provider."""
+        if self.AI_PROVIDER == "groq":
+            return self.GROQ_MODEL
+        return self.GEMINI_MODEL
 
     @model_validator(mode="after")
     def validate_production_admin_api_key(self) -> "Settings":

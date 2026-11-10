@@ -49,12 +49,12 @@ class _PayPalCallCounter:
 def _response(risk: str = "LOW") -> httpx.Response:
     return httpx.Response(
         200,
-        json={"candidates": [{"content": {"parts": [{"text": json.dumps({
+        json={"choices": [{"message": {"role": "assistant", "content": json.dumps({
             "schema_version": "1.0",
             "risk_level": risk,
             "finding_codes": [],
             "affected_fields": [],
-        })}]}}]},
+        })}}]},
     )
 
 

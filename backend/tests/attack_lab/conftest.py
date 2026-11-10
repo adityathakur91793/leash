@@ -59,6 +59,7 @@ def init_test_db(monkeypatch: pytest.MonkeyPatch) -> None:
 def attack_lab_safety(monkeypatch: pytest.MonkeyPatch) -> BlockedDestinations:
     """Use dummy provider configuration and deny every unmocked HTTPX transport."""
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "attack-lab-gemini-key")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "attack-lab-groq-key")
     monkeypatch.setattr(settings, "PAYPAL_CLIENT_ID", "attack-lab-client-id")
     monkeypatch.setattr(settings, "PAYPAL_CLIENT_SECRET", "attack-lab-client-secret")
     monkeypatch.setattr(settings, "MANDATE_SIGNING_KEY", "attack-lab-signing-key-32-bytes!!")
@@ -253,8 +254,8 @@ async def attack_gemini_client(
 
 @pytest.fixture
 def attack_intent_script() -> ScriptedHTTPX:
-    """Script the no-tools Gemini Intent Auditor endpoint locally."""
-    return ScriptedHTTPX(expected_host="generativelanguage.googleapis.com")
+    """Script the no-tools Groq/OpenAI-compatible Intent Auditor endpoint locally."""
+    return ScriptedHTTPX(expected_host="api.groq.com")
 
 
 @pytest.fixture

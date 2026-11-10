@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from pydantic import ValidationError
 
+from app.core.config import settings
 from app.core.untrusted_content import inspect_untrusted_text
 from app.schemas.mandate import MandateStatus
 from app.schemas.authorization import public_policy_decision
@@ -31,6 +33,13 @@ from app.services.gemini_client import (
     GeminiConfigurationError,
     GeminiProviderError,
     GeminiRateLimitError,
+    SHOPPING_SYSTEM_INSTRUCTION,
+)
+from app.services.groq_client import (
+    GroqClient,
+    GroqConfigurationError,
+    GroqProviderError,
+    GroqRateLimitError,
 )
 from app.services.kill_switch_service import enforce_kill_switch_guard
 from app.services.mandate_service import get_mandate, verify_mandate
@@ -144,22 +153,24 @@ async def _dispatch_tool(
     raise ShoppingAgentInputError("Requested tool is not allowed.")
 
 
-async def run_shopping_agent(
-    message: str,
+def _resolve_provider(client: Any) -> str:
+    """Determine whether to use Groq or Gemini for this agent execution."""
+    if client is not None:
+        if getattr(client, "provider", None) in {"groq", "gemini"}:
+            return client.provider
+        if hasattr(client, "generate"):
+            return "gemini"
+    return settings.AI_PROVIDER
+
+
+async def _run_gemini_shopping_agent(
+    sanitized: str,
     *,
     user_id: str,
     mandate_id: str | None,
-    client: GeminiClient | None = None,
+    client: Any = None,
 ) -> ShoppingAgentResponse:
-    """Run a bounded Gemini conversation and execute only allowlisted tools."""
-    sanitized, _, suspicious = inspect_untrusted_text(message, max_length=1500)
-    if not sanitized:
-        raise ShoppingAgentInputError("Message must contain readable text.")
-    if suspicious:
-        raise ShoppingAgentInputError(
-            "Request contains instruction-like text and was not sent to the model."
-        )
-    # Keep user content explicitly marked as data inside the fixed system boundary.
+    """Run bounded Gemini conversation and execute only allowlisted tools."""
     contents: list[dict[str, Any]] = [{
         "role": "user",
         "parts": [{"text": f"User request (untrusted): {sanitized}"}],
@@ -171,16 +182,39 @@ async def run_shopping_agent(
     gemini = client or GeminiClient()
     tool_schemas = {item["name"] for item in FUNCTION_DECLARATIONS}
     known_products: dict[str, ProductRecord] = {}
+    request_id = uuid.uuid4().hex
+    has_tool_response = False
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await gemini.generate(contents)
+        stage = "after_tool_response" if has_tool_response else "initial_generation"
+        response = await gemini.generate(
+            contents, request_id=request_id, stage=stage
+        )
         candidates = response.get("candidates")
         if not isinstance(candidates, list) or not candidates:
-            raise GeminiProviderError("Shopping Agent provider response was malformed.")
+            raise GeminiProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category="missing_candidate",
+                provider_http_status=200,
+            )
         candidate = candidates[0]
         content = candidate.get("content") if isinstance(candidate, dict) else None
         parts = content.get("parts") if isinstance(content, dict) else None
         if not isinstance(parts, list) or not parts:
-            raise GeminiProviderError("Shopping Agent provider response was malformed.")
+            finish_reason = candidate.get("finishReason") if isinstance(candidate, dict) else None
+            category = (
+                "empty_stop_response"
+                if finish_reason == "STOP"
+                else "missing_response_parts"
+            )
+            raise GeminiProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category=category,
+                provider_http_status=200,
+            )
         function_calls = [
             part["functionCall"]
             for part in parts
@@ -192,7 +226,19 @@ async def run_shopping_agent(
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             ).strip()
             if not answer:
-                raise GeminiProviderError("Shopping Agent provider response was malformed.")
+                finish_reason = candidate.get("finishReason")
+                category = (
+                    "empty_stop_response"
+                    if finish_reason == "STOP"
+                    else "missing_response_text"
+                )
+                raise GeminiProviderError(
+                    "Shopping Agent provider response was malformed.",
+                    request_id=request_id,
+                    stage=stage,
+                    category=category,
+                    provider_http_status=200,
+                )
             plain, _, _ = inspect_untrusted_text(answer, max_length=2000)
             return ShoppingAgentResponse(
                 message=plain or "I could not form a response.",
@@ -200,12 +246,29 @@ async def run_shopping_agent(
             )
         # One call per model turn prevents parallel purchase proposals.
         if len(function_calls) != 1:
-            raise GeminiProviderError("Shopping Agent returned an unsupported tool call batch.")
+            raise GeminiProviderError(
+                "Shopping Agent returned an unsupported tool call batch.",
+                request_id=request_id,
+                stage=stage,
+                category="unsupported_function_call_batch",
+                provider_http_status=200,
+            )
         call = function_calls[0]
         name = call.get("name") if isinstance(call, dict) else None
         args = call.get("args") if isinstance(call, dict) else None
         if not isinstance(name, str) or name not in tool_schemas:
             raise ShoppingAgentInputError("Requested tool is not allowed.")
+        call_id = call.get("id")
+        active_model = getattr(gemini, "model", None) or settings.GEMINI_MODEL
+        is_gemini_3 = active_model.removeprefix("models/").startswith("gemini-3")
+        if is_gemini_3 and (not isinstance(call_id, str) or not call_id):
+            raise GeminiProviderError(
+                "Gemini 3 function call is missing its required ID.",
+                request_id=request_id,
+                stage=stage,
+                category="missing_function_call_id",
+                provider_http_status=200,
+            )
         try:
             result = await _dispatch_tool(
                 name, args, user_id=user_id, mandate_id=mandate_id
@@ -238,13 +301,236 @@ async def run_shopping_agent(
             )
         result_text = json.dumps(result, separators=(",", ":"))
         if len(result_text.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
-            raise GeminiProviderError("Shopping Agent catalogue response exceeded its limit.")
+            raise GeminiProviderError(
+                "Shopping Agent catalogue response exceeded its limit.",
+                request_id=request_id,
+                stage=stage,
+                category="tool_response_too_large",
+                provider_http_status=200,
+            )
+        function_response: dict[str, Any] = {"name": name, "response": result}
+        if call_id is not None:
+            function_response["id"] = call_id
         contents.extend([
-            {"role": "model", "parts": [{"functionCall": {"name": name, "args": args}}]},
-            {"role": "user", "parts": [{"functionResponse": {"name": name, "response": result}}]},
+            content,
+            {"role": "user", "parts": [{"functionResponse": function_response}]},
         ])
+        has_tool_response = True
         if len(json.dumps(contents).encode("utf-8")) > MAX_CONVERSATION_BYTES:
-            raise GeminiProviderError("Shopping Agent conversation exceeded its limit.")
+            raise GeminiProviderError(
+                "Shopping Agent conversation exceeded its limit.",
+                request_id=request_id,
+                stage=stage,
+                category="conversation_too_large",
+                provider_http_status=200,
+            )
     return ShoppingAgentResponse(
         message="I could not complete that request within the tool limit."
+    )
+
+
+async def _run_groq_shopping_agent(
+    sanitized: str,
+    *,
+    user_id: str,
+    mandate_id: str | None,
+    client: Any = None,
+) -> ShoppingAgentResponse:
+    """Run bounded Groq OpenAI-compatible conversation and execute only allowlisted tools."""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SHOPPING_SYSTEM_INSTRUCTION},
+        {"role": "user", "content": f"User request (untrusted): {sanitized}"},
+    ]
+    serialized_size = len(json.dumps(messages).encode("utf-8"))
+    if serialized_size > MAX_CONVERSATION_BYTES:
+        raise ShoppingAgentInputError("Shopping request is too large.")
+
+    groq = client or GroqClient()
+    tool_schemas = {item["name"] for item in FUNCTION_DECLARATIONS}
+    known_products: dict[str, ProductRecord] = {}
+    request_id = uuid.uuid4().hex
+    has_tool_response = False
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        stage = "after_tool_response" if has_tool_response else "initial_generation"
+        response = await groq.generate(
+            messages, request_id=request_id, stage=stage
+        )
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise GroqProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category="missing_candidate",
+                provider_http_status=200,
+            )
+        choice = choices[0]
+        message_obj = choice.get("message") if isinstance(choice, dict) else None
+        if not isinstance(message_obj, dict):
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+            category = (
+                "empty_stop_response"
+                if finish_reason == "stop"
+                else "missing_response_parts"
+            )
+            raise GroqProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category=category,
+                provider_http_status=200,
+            )
+        tool_calls = message_obj.get("tool_calls")
+        if not tool_calls:
+            answer = (message_obj.get("content") or "").strip()
+            if not answer:
+                finish_reason = choice.get("finish_reason")
+                category = (
+                    "empty_stop_response"
+                    if finish_reason == "stop"
+                    else "missing_response_text"
+                )
+                raise GroqProviderError(
+                    "Shopping Agent provider response was malformed.",
+                    request_id=request_id,
+                    stage=stage,
+                    category=category,
+                    provider_http_status=200,
+                )
+            plain, _, _ = inspect_untrusted_text(answer, max_length=2000)
+            return ShoppingAgentResponse(
+                message=plain or "I could not form a response.",
+                products=list(known_products.values()),
+            )
+        if len(tool_calls) != 1:
+            raise GroqProviderError(
+                "Shopping Agent returned an unsupported tool call batch.",
+                request_id=request_id,
+                stage=stage,
+                category="unsupported_function_call_batch",
+                provider_http_status=200,
+            )
+        call = tool_calls[0]
+        if not isinstance(call, dict):
+            raise GroqProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category="malformed_response",
+                provider_http_status=200,
+            )
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            raise GroqProviderError(
+                "Groq function call is missing its required ID.",
+                request_id=request_id,
+                stage=stage,
+                category="missing_function_call_id",
+                provider_http_status=200,
+            )
+        func = call.get("function")
+        if not isinstance(func, dict):
+            raise ShoppingAgentInputError("Tool arguments must be an object.")
+        name = func.get("name")
+        if not isinstance(name, str) or name not in tool_schemas:
+            raise ShoppingAgentInputError("Requested tool is not allowed.")
+        raw_args = func.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except Exception as exc:
+                raise ShoppingAgentInputError("Tool arguments failed strict validation.") from exc
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            raise ShoppingAgentInputError("Tool arguments must be an object.")
+
+        try:
+            result = await _dispatch_tool(
+                name, args, user_id=user_id, mandate_id=mandate_id
+            )
+        except ValidationError as exc:
+            raise ShoppingAgentInputError("Tool arguments failed strict validation.") from exc
+
+        if name == "search_products":
+            for item in result["products"]:
+                product = ProductRecord.model_validate(item)
+                if product.product_id in known_products or len(known_products) < 25:
+                    known_products[product.product_id] = product
+        elif name == "get_product" and result.get("found"):
+            product = ProductRecord.model_validate(result["product"])
+            if product.product_id in known_products or len(known_products) < 25:
+                known_products[product.product_id] = product
+        if name == "propose_purchase":
+            proposal_data = result["proposal"]
+            proposed_product = get_product(args["product_id"])
+            if proposed_product.product_id in known_products or len(known_products) < 25:
+                known_products[proposed_product.product_id] = proposed_product
+            return ShoppingAgentResponse(
+                message=(
+                    "Proposal submitted to LEASH policy evaluation. Review the proposal "
+                    "and policy result below; this does not execute a payment."
+                ),
+                products=list(known_products.values()),
+                proposal=ProposalToolResult.model_validate(proposal_data),
+            )
+        result_text = json.dumps(result, separators=(",", ":"))
+        if len(result_text.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
+            raise GroqProviderError(
+                "Shopping Agent catalogue response exceeded its limit.",
+                request_id=request_id,
+                stage=stage,
+                category="tool_response_too_large",
+                provider_http_status=200,
+            )
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": message_obj.get("content") or None,
+                "tool_calls": [call],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result_text,
+            },
+        ])
+        has_tool_response = True
+        if len(json.dumps(messages).encode("utf-8")) > MAX_CONVERSATION_BYTES:
+            raise GroqProviderError(
+                "Shopping Agent conversation exceeded its limit.",
+                request_id=request_id,
+                stage=stage,
+                category="conversation_too_large",
+                provider_http_status=200,
+            )
+    return ShoppingAgentResponse(
+        message="I could not complete that request within the tool limit."
+    )
+
+
+async def run_shopping_agent(
+    message: str,
+    *,
+    user_id: str,
+    mandate_id: str | None,
+    client: Any = None,
+) -> ShoppingAgentResponse:
+    """Run a bounded Shopping Agent conversation with the configured provider."""
+    sanitized, _, suspicious = inspect_untrusted_text(message, max_length=1500)
+    if not sanitized:
+        raise ShoppingAgentInputError("Message must contain readable text.")
+    if suspicious:
+        raise ShoppingAgentInputError(
+            "Request contains instruction-like text and was not sent to the model."
+        )
+
+    provider = _resolve_provider(client)
+    if provider == "groq":
+        return await _run_groq_shopping_agent(
+            sanitized, user_id=user_id, mandate_id=mandate_id, client=client
+        )
+    return await _run_gemini_shopping_agent(
+        sanitized, user_id=user_id, mandate_id=mandate_id, client=client
     )

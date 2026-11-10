@@ -26,12 +26,12 @@ from tests.attack_lab.support import AttackCase, AsyncBarrier, ScriptedHTTPX
 def _risk_response(risk: str) -> httpx.Response:
     return httpx.Response(
         200,
-        json={"candidates": [{"content": {"parts": [{"text": json.dumps({
+        json={"choices": [{"message": {"role": "assistant", "content": json.dumps({
             "schema_version": "1.0",
             "risk_level": risk,
             "finding_codes": [],
             "affected_fields": [],
-        })}]}}]},
+        })}}]},
     )
 
 

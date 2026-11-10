@@ -134,12 +134,19 @@ async def test_intent_auditor_mock_records_no_tools(
     )
     script.queue_response(httpx.Response(
         200,
-        json={"candidates": [{"content": {"parts": [{"text": json.dumps({
-            "schema_version": "1.0",
-            "risk_level": "LOW",
-            "finding_codes": [],
-            "affected_fields": [],
-        })}]}}]},
+        json={
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "schema_version": "1.0",
+                        "risk_level": "LOW",
+                        "finding_codes": [],
+                        "affected_fields": [],
+                    }),
+                }
+            }]
+        },
     ))
 
     result = await client.assess(payload)

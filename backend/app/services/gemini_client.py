@@ -1,14 +1,12 @@
 """Small server-side Gemini REST client using existing httpx dependency."""
 
 import json
-import logging
+import re
 from typing import Any
 
 import httpx
 
 from app.core.config import settings
-
-logger = logging.getLogger(__name__)
 
 GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_GEMINI_RESPONSE_BYTES = 256_000
@@ -18,12 +16,29 @@ class GeminiConfigurationError(Exception):
     """Raised when the backend-only Gemini configuration is unavailable."""
 
 
-class GeminiRateLimitError(Exception):
-    """Raised when Gemini returns a rate-limit response."""
-
-
 class GeminiProviderError(Exception):
     """Raised for safe, non-specific Gemini transport or response failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str | None = None,
+        stage: str = "initial_generation",
+        category: str = "provider_error",
+        provider_http_status: int | None = None,
+        provider_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.stage = stage
+        self.category = category
+        self.provider_http_status = provider_http_status
+        self.provider_code = provider_code
+
+
+class GeminiRateLimitError(GeminiProviderError):
+    """Raised when Gemini returns a rate-limit response."""
 
 
 class GeminiClient:
@@ -40,7 +55,18 @@ class GeminiClient:
         self._model = model or settings.GEMINI_MODEL
         self._client = client
 
-    async def generate(self, contents: list[dict[str, Any]]) -> dict[str, Any]:
+    @property
+    def model(self) -> str:
+        """Configured Gemini model identifier."""
+        return self._model
+
+    async def generate(
+        self,
+        contents: list[dict[str, Any]],
+        *,
+        request_id: str | None = None,
+        stage: str = "initial_generation",
+    ) -> dict[str, Any]:
         if not self._api_key:
             raise GeminiConfigurationError("Gemini API key is not configured.")
         url = f"{GEMINI_API_ROOT}/{self._model}:generateContent"
@@ -58,7 +84,7 @@ class GeminiClient:
                     ],
                 }
             },
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
+            "generationConfig": {"maxOutputTokens": 512},
         }
         try:
             if self._client is not None:
@@ -69,7 +95,9 @@ class GeminiClient:
                     json=body,
                     timeout=20.0,
                 ) as response:
-                    return await self._read_response(response)
+                    return await self._read_response(
+                        response, request_id=request_id, stage=stage
+                    )
             async with httpx.AsyncClient(timeout=20.0) as client:
                 async with client.stream(
                     "POST",
@@ -77,34 +105,101 @@ class GeminiClient:
                     headers={"x-goog-api-key": self._api_key},
                     json=body,
                 ) as response:
-                    return await self._read_response(response)
+                    return await self._read_response(
+                        response, request_id=request_id, stage=stage
+                    )
         except (GeminiRateLimitError, GeminiProviderError):
             raise
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            logger.warning("Gemini request failed due to a network error.")
             raise GeminiProviderError(
-                "Shopping Agent provider is temporarily unavailable."
+                "Shopping Agent provider is temporarily unavailable.",
+                request_id=request_id,
+                stage=stage,
+                category="network_error",
             ) from exc
 
     @staticmethod
-    async def _read_response(response: httpx.Response) -> dict[str, Any]:
-        if response.status_code == 429:
-            raise GeminiRateLimitError("Shopping Agent is rate limited. Try again later.")
+    async def _read_response(
+        response: httpx.Response,
+        *,
+        request_id: str | None = None,
+        stage: str = "initial_generation",
+    ) -> dict[str, Any]:
         if response.status_code < 200 or response.status_code >= 300:
-            logger.warning("Gemini request returned HTTP %d.", response.status_code)
-            raise GeminiProviderError("Shopping Agent provider returned an error.")
+            provider_category, provider_code = await _safe_provider_error_metadata(response)
+            error_type = (
+                GeminiRateLimitError
+                if response.status_code == 429
+                else GeminiProviderError
+            )
+            message = (
+                "Shopping Agent is rate limited. Try again later."
+                if response.status_code == 429
+                else "Shopping Agent provider returned an error."
+            )
+            raise error_type(
+                message,
+                request_id=request_id,
+                stage=stage,
+                category=provider_category,
+                provider_http_status=response.status_code,
+                provider_code=provider_code,
+            )
         data = bytearray()
         async for chunk in response.aiter_bytes():
             data.extend(chunk)
             if len(data) > MAX_GEMINI_RESPONSE_BYTES:
-                raise GeminiProviderError("Shopping Agent provider response exceeded its limit.")
+                raise GeminiProviderError(
+                    "Shopping Agent provider response exceeded its limit.",
+                    request_id=request_id,
+                    stage=stage,
+                    category="response_too_large",
+                    provider_http_status=response.status_code,
+                )
         try:
             parsed = json.loads(data)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise GeminiProviderError("Shopping Agent provider response was malformed.") from exc
+            raise GeminiProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category="malformed_response",
+                provider_http_status=response.status_code,
+            ) from exc
         if not isinstance(parsed, dict):
-            raise GeminiProviderError("Shopping Agent provider response was malformed.")
+            raise GeminiProviderError(
+                "Shopping Agent provider response was malformed.",
+                request_id=request_id,
+                stage=stage,
+                category="malformed_response",
+                provider_http_status=response.status_code,
+            )
         return parsed
+
+
+async def _safe_provider_error_metadata(response: httpx.Response) -> tuple[str, int | None]:
+    """Extract only a bounded, allowlisted category and numeric code from provider errors."""
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > 16_384:
+            return "provider_error", None
+    try:
+        envelope = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "provider_error", None
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    if not isinstance(error, dict):
+        return "provider_error", None
+    raw_category = error.get("status")
+    category = (
+        raw_category
+        if isinstance(raw_category, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", raw_category)
+        else "provider_error"
+    )
+    raw_code = error.get("code")
+    provider_code = raw_code if isinstance(raw_code, int) and 100 <= raw_code <= 599 else None
+    return category, provider_code
 
 
 SHOPPING_SYSTEM_INSTRUCTION = """You are the LEASH Shopping Agent.

@@ -113,8 +113,8 @@ class ScriptedHTTPX:
 
         declared_tools: tuple[str, ...] = ()
         model_tool_calls: tuple[str, ...] = ()
-        if host == "generativelanguage.googleapis.com":
-            declared_tools, model_tool_calls = self._gemini_tool_names(request)
+        if host in {"generativelanguage.googleapis.com", "api.groq.com"}:
+            declared_tools, model_tool_calls = self._provider_tool_names(request)
         self.requests.append(
             RequestEvidence(
                 method=request.method,
@@ -132,36 +132,71 @@ class ScriptedHTTPX:
         scripted = self._responses.popleft()
         if isinstance(scripted, Exception):
             raise scripted
-        if host == "generativelanguage.googleapis.com":
+        if host in {"generativelanguage.googleapis.com", "api.groq.com"}:
             self._record_response_tool_calls(scripted)
         return scripted
 
     @staticmethod
-    def _gemini_tool_names(request: httpx.Request) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def _provider_tool_names(request: httpx.Request) -> tuple[tuple[str, ...], tuple[str, ...]]:
         try:
             body = json.loads(request.content)
-            declarations = body.get("tools", [])
-            names = tuple(
-                item["name"]
-                for group in declarations
-                for item in group.get("functionDeclarations", [])
-                if isinstance(item, dict) and isinstance(item.get("name"), str)
-            )
-            return names, ()
-        except (TypeError, ValueError, KeyError):
+        except (TypeError, ValueError):
             return (), ()
+
+        root_tools = body.get("tools", [])
+        if isinstance(root_tools, list):
+            names: list[str] = []
+            for entry in root_tools:
+                if not isinstance(entry, dict):
+                    continue
+                if "function" in entry and isinstance(entry.get("function"), dict):
+                    function_name = entry["function"].get("name")
+                    if isinstance(function_name, str):
+                        names.append(function_name)
+                elif isinstance(entry.get("name"), str):
+                    names.append(entry["name"])
+                else:
+                    for item in entry.get("functionDeclarations", []):
+                        if isinstance(item, dict) and isinstance(item.get("name"), str):
+                            names.append(item["name"])
+            return tuple(names), ()
+        return (), ()
+
+    @staticmethod
+    def _response_tool_calls(body: Any) -> tuple[str, ...]:
+        names: list[str] = []
+        if not isinstance(body, dict):
+            return ()
+
+        for candidate in body.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            for part in candidate.get("content", {}).get("parts", []):
+                if not isinstance(part, dict):
+                    continue
+                call = part.get("functionCall", {})
+                if isinstance(call, dict) and isinstance(call.get("name"), str):
+                    names.append(call["name"])
+
+        for choice in body.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message", {})
+            if not isinstance(message, dict):
+                continue
+            for tool_call in message.get("tool_calls", []) or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function", {})
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    names.append(function["name"])
+        return tuple(names)
 
     def _record_response_tool_calls(self, response: httpx.Response) -> None:
         """Replace the last request record with response tool names only."""
         try:
             body = response.json()
-            names = tuple(
-                call["name"]
-                for candidate in body.get("candidates", [])
-                for part in candidate.get("content", {}).get("parts", [])
-                for call in [part.get("functionCall", {})]
-                if isinstance(call.get("name"), str)
-            )
+            names = self._response_tool_calls(body)
         except (ValueError, AttributeError, TypeError):
             names = ()
         current = self.requests[-1]

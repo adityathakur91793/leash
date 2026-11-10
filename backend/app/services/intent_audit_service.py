@@ -306,7 +306,7 @@ async def assess_and_persist(
                     "AND prompt_version = ? AND model_identifier = ? "
                     "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     (proposal_id, p_hash, m_hash, policy_hash, SCHEMA_VERSION,
-                     PROMPT_VERSION, settings.GEMINI_MODEL),
+                     PROMPT_VERSION, settings.active_ai_model),
                 )
                 existing = await cursor.fetchone()
                 if existing is not None:
@@ -326,7 +326,7 @@ async def assess_and_persist(
                  json.dumps([v.value for v in result.finding_codes]),
                  json.dumps([v.value for v in result.affected_fields]), p_hash, m_hash,
                  policy_hash, POLICY_VERSION, SCHEMA_VERSION, PROMPT_VERSION,
-                 __import__("app.core.config", fromlist=["settings"]).settings.GEMINI_MODEL,
+                 __import__("app.core.config", fromlist=["settings"]).settings.active_ai_model,
                  failure, created),
             )
             event = (AuditEventType.INTENT_ASSESSMENT_COMPLETED
@@ -375,7 +375,7 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
             raise IntentAuditorUnavailable(
                 "An uncertain intent assessment cannot authorize progression."
             )
-        active_versions = (POLICY_VERSION, SCHEMA_VERSION, PROMPT_VERSION, settings.GEMINI_MODEL)
+        active_versions = (POLICY_VERSION, SCHEMA_VERSION, PROMPT_VERSION, settings.active_ai_model)
         stored_versions = (row[10], row[11], row[12], row[13])
         if (not all(isinstance(version, str) and version for version in stored_versions)
                 or stored_versions != active_versions):
@@ -510,7 +510,7 @@ async def _assessment_is_current(
         return False
     if record.prompt_version != PROMPT_VERSION:
         return False
-    if record.model_identifier != settings.GEMINI_MODEL:
+    if record.model_identifier != settings.active_ai_model:
         return False
     if record.proposal_content_hash != proposal.content_hash:
         return False

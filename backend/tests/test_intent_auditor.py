@@ -100,6 +100,8 @@ async def test_input_minimizes_fields_and_quarantines_injection() -> None:
 async def test_gemini_request_has_no_tools_and_validates_json(monkeypatch) -> None:
     from app.core.config import settings
 
+    monkeypatch.setattr(IntentAuditorClient, "assess", IntentAuditorClient._assess_gemini)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "gemini")
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "test-key")
     body_seen = {}
 
@@ -130,6 +132,58 @@ async def test_gemini_request_has_no_tools_and_validates_json(monkeypatch) -> No
         )
     assert result.risk_level.value == "LOW"
     assert "tools" not in body_seen and "toolConfig" not in body_seen
+
+
+@pytest.mark.asyncio
+async def test_groq_request_has_no_tools_and_validates_json(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(IntentAuditorClient, "assess", IntentAuditorClient._assess_groq)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "test-groq-key")
+    body_seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body_seen.update(__import__("json").loads(request.content))
+        assert request.headers.get("authorization") == "Bearer test-groq-key"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                '{"schema_version":"1.0","risk_level":"LOW",'
+                                '"finding_codes":[],"affected_fields":[]}'
+                            ),
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await IntentAuditorClient(http).assess(
+            IntentAuditorInput.model_validate({
+                "mandate": {
+                    "currency": "USD", "max_total_budget": "100.00",
+                    "max_price_per_item": None, "max_item_count": 1,
+                    "max_quantity_per_item": 1, "allowed_merchants": ["shop.example"],
+                    "allowed_categories": ["books"], "allow_subscriptions": False,
+                    "require_user_approval": False, "is_active_and_unexpired": True,
+                },
+                "proposal": {"product_name": "Book", "merchant": "shop.example",
+                    "category": "books", "quantity": 1, "unit_price": "10.00",
+                    "total": "10.00", "currency": "USD"},
+                "deterministic_outcome": "ALLOW",
+                "policy_rules": [{"rule_id": f"P{i:02d}", "status": "PASS"}
+                                 for i in range(1, 13)],
+            })
+        )
+    assert result.risk_level.value == "LOW"
+    assert "tools" not in body_seen and "tool_choice" not in body_seen
+    assert body_seen.get("response_format") == {"type": "json_object"}
 
 
 @pytest.mark.asyncio
@@ -303,7 +357,7 @@ async def _set_assessment_version(proposal_id: str, field: str, value: str) -> N
     [
         ("schema_version", "1.0"),
         ("prompt_version", "intent-auditor-v1"),
-        ("model_identifier", "gemini-2.5-flash"),
+        ("model_identifier", "valid-model"),
         ("schema_version", ""),  # malformed/missing metadata fails closed
     ],
 )
@@ -317,7 +371,7 @@ async def test_assessment_version_mismatch_is_stale(field, current, monkeypatch)
     active = {
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
-        "model_identifier": settings.GEMINI_MODEL,
+        "model_identifier": settings.active_ai_model,
     }[field]
     replacement = "" if not current else ("different-model" if field == "model_identifier" else "stale")
     assert replacement != active

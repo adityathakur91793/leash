@@ -1,5 +1,7 @@
 """Authenticated Shopping Agent API."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.dependencies import get_current_session
@@ -16,6 +18,11 @@ from app.services.gemini_client import (
     GeminiProviderError,
     GeminiRateLimitError,
 )
+from app.services.groq_client import (
+    GroqConfigurationError,
+    GroqProviderError,
+    GroqRateLimitError,
+)
 from app.services.mandate_service import (
     MandateNotFoundError,
     get_mandate,
@@ -30,6 +37,28 @@ from app.services.shopping_agent_service import (
 from app.services.intent_auditor_client import IntentAuditorUnavailable
 
 router = APIRouter(prefix="/shopping-agent", tags=["Shopping Agent"])
+logger = logging.getLogger(__name__)
+
+
+def _log_provider_failure(
+    exc: GeminiProviderError | GroqProviderError,
+    provider: str = "AI",
+) -> None:
+    """Log bounded provider diagnostics without request, response, or credential data."""
+    logger.warning(
+        "Shopping Agent %s failure request_id=%s stage=%s category=%s "
+        "provider_http_status=%s provider_code=%s",
+        provider,
+        getattr(exc, "request_id", None) or "unavailable",
+        getattr(exc, "stage", "initial_generation"),
+        getattr(exc, "category", "provider_error"),
+        getattr(exc, "provider_http_status", None) or "unavailable",
+        getattr(exc, "provider_code", None) or "unavailable",
+    )
+
+
+def _log_gemini_failure(exc: GeminiProviderError) -> None:
+    _log_provider_failure(exc, provider="Gemini")
 
 
 @router.get("/mandates", response_model=list[OwnedMandateOption])
@@ -80,14 +109,16 @@ async def chat(
         ) from exc
     except MandateNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Selected mandate was not found.") from exc
-    except GeminiConfigurationError as exc:
+    except (GeminiConfigurationError, GroqConfigurationError) as exc:
         raise HTTPException(status_code=503, detail="Shopping Agent is not configured.") from exc
-    except GeminiRateLimitError as exc:
+    except (GeminiRateLimitError, GroqRateLimitError) as exc:
+        _log_provider_failure(exc, provider="Groq" if isinstance(exc, GroqRateLimitError) else "Gemini")
         raise HTTPException(
             status_code=429,
             detail="Shopping Agent is busy. Try again shortly.",
         ) from exc
-    except GeminiProviderError as exc:
+    except (GeminiProviderError, GroqProviderError) as exc:
+        _log_provider_failure(exc, provider="Groq" if isinstance(exc, GroqProviderError) else "Gemini")
         raise HTTPException(
             status_code=502,
             detail="Shopping Agent provider is unavailable.",
