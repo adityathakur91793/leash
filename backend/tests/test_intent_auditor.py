@@ -184,7 +184,63 @@ async def test_groq_request_has_no_tools_and_validates_json(monkeypatch) -> None
         )
     assert result.risk_level.value == "LOW"
     assert "tools" not in body_seen and "tool_choice" not in body_seen
-    assert body_seen.get("response_format") == {"type": "json_object"}
+    assert body_seen.get("response_format", {}).get("type") == "json_schema"
+    assert body_seen["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_groq_structured_output_matches_exact_auditor_schema(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(IntentAuditorClient, "assess", IntentAuditorClient._assess_groq)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "test-groq-key")
+    body_seen = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body_seen.update(__import__("json").loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": __import__("json").dumps({
+                                "schema_version": "1.0",
+                                "risk_level": "LOW",
+                                "finding_codes": ["AMBIGUOUS_INTENT"],
+                                "affected_fields": ["product_name"],
+                            })
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await IntentAuditorClient(http).assess(
+            IntentAuditorInput.model_validate({
+                "mandate": {
+                    "currency": "USD", "max_total_budget": "100.00",
+                    "max_price_per_item": None, "max_item_count": 1,
+                    "max_quantity_per_item": 1, "allowed_merchants": ["shop.example"],
+                    "allowed_categories": ["books"], "allow_subscriptions": False,
+                    "require_user_approval": False, "is_active_and_unexpired": True,
+                },
+                "proposal": {"product_name": "Book", "merchant": "shop.example",
+                    "category": "books", "quantity": 1, "unit_price": "10.00",
+                    "total": "10.00", "currency": "USD"},
+                "deterministic_outcome": "ALLOW",
+                "policy_rules": [{"rule_id": f"P{i:02d}", "status": "PASS"}
+                                 for i in range(1, 13)],
+            })
+        )
+    assert result.schema_version == "1.0"
+    assert result.risk_level == "LOW"
+    assert list(result.finding_codes) == ["AMBIGUOUS_INTENT"]
+    assert list(result.affected_fields) == ["product_name"]
+    assert body_seen.get("response_format", {}).get("type") == "json_schema"
+    assert body_seen["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
 
 
 @pytest.mark.asyncio
