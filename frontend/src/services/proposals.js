@@ -219,6 +219,30 @@ export function validateIntentAssessmentResponse(value, expectedProposalId) {
   return value.assessment;
 }
 
+export function createProposal(token, payload) {
+  const body = {
+    mandate_id: payload.mandate_id,
+    product_id: payload.product_id,
+    product_name: payload.product_name,
+    merchant: payload.merchant,
+    category: payload.category,
+    quantity: Number(payload.quantity),
+    unit_price: String(payload.unit_price),
+    currency: payload.currency,
+    tax: String(payload.tax ?? '0.00'),
+    shipping: String(payload.shipping ?? '0.00'),
+    other_charges: String(payload.other_charges ?? '0.00'),
+    product_source: payload.product_source,
+    ...(payload.idempotency_key ? { idempotency_key: payload.idempotency_key } : {}),
+  };
+  return request('/api/v1/proposals', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    token,
+    body: JSON.stringify(body),
+  });
+}
+
 export function listProposals(token, limit = 100) {
   return request(`/api/v1/proposals?limit=${Math.min(100, Math.max(1, limit))}`, { token });
 }

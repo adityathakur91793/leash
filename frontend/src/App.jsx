@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Activity, CheckCircle, LayoutDashboard, Loader, LogOut, RefreshCw, Shield, ShoppingBag, SlidersHorizontal, XCircle } from 'lucide-react';
 import { useBackendStatus } from './hooks/useBackendStatus';
 import { useSession } from './hooks/useSession';
@@ -34,6 +34,17 @@ function App() {
     session.markExpired,
     session.status === 'active' ? session.userId : null,
   );
+
+  useEffect(() => {
+    if (session.status !== 'active') return undefined;
+    const handleProposalRefresh = () => {
+      void proposalState.refresh();
+    };
+    window.addEventListener('leash:proposal-list-refresh', handleProposalRefresh);
+    return () => {
+      window.removeEventListener('leash:proposal-list-refresh', handleProposalRefresh);
+    };
+  }, [proposalState.refresh, session.status]);
 
   const sessionLabel = {
     loading: 'Connecting',

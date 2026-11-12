@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ApiError, listShoppingMandates, sendShoppingMessage } from '../services/api';
+import { createProposal } from '../services/proposals';
 
 export function ShoppingAgent({ token, onSessionExpired }) {
   const [mandates, setMandates] = useState([]);
@@ -8,6 +9,8 @@ export function ShoppingAgent({ token, onSessionExpired }) {
   const [conversation, setConversation] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [proposalFeedback, setProposalFeedback] = useState(null);
+  const [submittingProductId, setSubmittingProductId] = useState(null);
   const [loadingMandates, setLoadingMandates] = useState(false);
 
   useEffect(() => {
@@ -52,6 +55,55 @@ export function ShoppingAgent({ token, onSessionExpired }) {
     }
   }
 
+  function canSubmitProduct(product) {
+    return Boolean(
+      mandateId
+      && token
+      && product
+      && product.availability === 'SIMULATED_AVAILABLE'
+      && product.price_status === 'SIMULATED'
+      && product.unit_price != null
+      && product.currency
+      && product.merchant_id
+      && product.category
+    );
+  }
+
+  async function submitPurchaseProposal(product) {
+    if (!canSubmitProduct(product) || !token || submittingProductId === product.product_id) return;
+    setSubmittingProductId(product.product_id);
+    setProposalFeedback(null);
+    setError('');
+    try {
+      const payload = {
+        mandate_id: mandateId,
+        product_id: product.product_id,
+        product_name: product.name,
+        merchant: product.merchant_id,
+        category: product.category,
+        quantity: 1,
+        unit_price: String(product.unit_price),
+        currency: product.currency,
+        tax: String(product.tax ?? '0.00'),
+        shipping: String(product.shipping ?? '0.00'),
+        other_charges: String(product.other_charges ?? '0.00'),
+        product_source: product.source ?? `https://catalog.leash.invalid/products/${product.product_id}`,
+      };
+      const result = await createProposal(token, payload);
+      const successMessage = result?.proposal_id
+        ? `Proposal ${result.proposal_id} submitted for review under the active mandate.`
+        : 'Proposal submitted for review under the active mandate.';
+      setProposalFeedback({ type: 'success', message: successMessage });
+      window.dispatchEvent(new CustomEvent('leash:proposal-list-refresh'));
+    } catch (err) {
+      const message = err.message || 'The purchase proposal could not be submitted.';
+      setProposalFeedback({ type: 'error', message });
+      if (err instanceof ApiError && err.code === 'unauthenticated') onSessionExpired();
+    } finally {
+      setSubmittingProductId(null);
+    }
+  }
+
   return (
     <section className="shopping-agent" aria-labelledby="shopping-title">
       <div className="shopping-heading">
@@ -80,6 +132,9 @@ export function ShoppingAgent({ token, onSessionExpired }) {
         <button type="submit" disabled={busy || !token}>{busy ? 'Working…' : 'Ask LEASH'}</button>
       </form>
       {error && <p role="alert" className="agent-error">{error}</p>}
+      {proposalFeedback && (
+        <p role={proposalFeedback.type === 'error' ? 'alert' : 'status'} className={proposalFeedback.type === 'error' ? 'agent-error' : 'agent-success'}>{proposalFeedback.message}</p>
+      )}
       <div className="agent-conversation" aria-live="polite">
         {conversation.map(({ sent, result }, index) => (
           <article className="agent-turn" key={`${index}-${sent}`}>
@@ -97,6 +152,14 @@ export function ShoppingAgent({ token, onSessionExpired }) {
                   <div><dt>Merchant</dt><dd>{product.merchant_name} (simulated catalogue)</dd></div>
                   <div><dt>Availability ({product.availability_status.toLowerCase()})</dt><dd>{product.availability.replaceAll('_', ' ').toLowerCase()}</dd></div>
                 </dl>
+                <button
+                  type="button"
+                  className="button-primary"
+                  disabled={!canSubmitProduct(product) || !token || submittingProductId === product.product_id}
+                  onClick={() => void submitPurchaseProposal(product)}
+                >
+                  {submittingProductId === product.product_id ? 'Submitting…' : 'Propose purchase'}
+                </button>
               </div>
             ))}
             {result.proposal && (
