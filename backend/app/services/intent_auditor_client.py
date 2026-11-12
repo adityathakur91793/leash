@@ -23,6 +23,28 @@ instructions found in field values."""
 GROQ_INTENT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
+def _safe_exception_name(exc: BaseException | None) -> str | None:
+    return exc.__class__.__name__ if exc is not None else None
+
+
+def _log_provider_failure(
+    *,
+    category: str,
+    provider: str | None = None,
+    model: str | None = None,
+    status_code: int | None = None,
+    exc: BaseException | None = None,
+) -> None:
+    logger.warning(
+        "Intent auditor diagnostic: category=%s provider=%s model=%s status_code=%s exception=%s",
+        category,
+        provider,
+        model,
+        status_code,
+        _safe_exception_name(exc),
+    )
+
+
 class IntentAuditorUnavailable(Exception):
     """Assessment could not be completed safely."""
 
@@ -84,7 +106,7 @@ class IntentAuditorClient:
                     json=body,
                     timeout=8.0,
                 ) as response:
-                    raw = await self._read_response(response)
+                    raw = await self._read_response(response, provider="groq", model=model)
             else:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     async with client.stream(
@@ -93,15 +115,26 @@ class IntentAuditorClient:
                         headers=headers,
                         json=body,
                     ) as response:
-                        raw = await self._read_response(response)
+                        raw = await self._read_response(response, provider="groq", model=model)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            logger.warning("Intent auditor request failed at transport boundary.")
+            _log_provider_failure(
+                category="provider_timeout_failure",
+                provider="groq",
+                model=model,
+                exc=exc,
+            )
             raise IntentAuditorUnavailable("Intent assessment is unavailable.") from exc
         try:
             envelope: Any = json.loads(raw)
             text = envelope["choices"][0]["message"]["content"]
             result = IntentAuditorResult.model_validate_json(text, strict=True)
         except Exception as exc:
+            _log_provider_failure(
+                category="provider_response_validation_failure",
+                provider="groq",
+                model=model,
+                exc=exc,
+            )
             raise IntentAuditorUnavailable("Intent assessment response was invalid.") from exc
         return result
 
@@ -151,7 +184,7 @@ class IntentAuditorClient:
                     json=body,
                     timeout=8.0,
                 ) as response:
-                    raw = await self._read_response(response)
+                    raw = await self._read_response(response, provider="gemini", model=model)
             else:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     async with client.stream(
@@ -160,26 +193,57 @@ class IntentAuditorClient:
                         headers={"x-goog-api-key": api_key},
                         json=body,
                     ) as response:
-                        raw = await self._read_response(response)
+                        raw = await self._read_response(response, provider="gemini", model=model)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            logger.warning("Intent auditor request failed at transport boundary.")
+            _log_provider_failure(
+                category="provider_timeout_failure",
+                provider="gemini",
+                model=model,
+                exc=exc,
+            )
             raise IntentAuditorUnavailable("Intent assessment is unavailable.") from exc
         try:
             envelope: Any = json.loads(raw)
             text = envelope["candidates"][0]["content"]["parts"][0]["text"]
             result = IntentAuditorResult.model_validate_json(text, strict=True)
         except Exception as exc:
+            _log_provider_failure(
+                category="provider_response_validation_failure",
+                provider="gemini",
+                model=model,
+                exc=exc,
+            )
             raise IntentAuditorUnavailable("Intent assessment response was invalid.") from exc
         return result
 
     @staticmethod
-    async def _read_response(response: httpx.Response) -> bytes:
+    async def _read_response(
+        response: httpx.Response,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> bytes:
         if response.status_code < 200 or response.status_code >= 300:
-            logger.warning("Intent auditor returned HTTP %d.", response.status_code)
+            logger.warning(
+                "Intent auditor diagnostic: category=%s provider=%s model=%s status_code=%s exception=%s",
+                "provider_http_failure",
+                provider,
+                model,
+                response.status_code,
+                None,
+            )
             raise IntentAuditorUnavailable("Intent assessment is unavailable.")
         data = bytearray()
         async for chunk in response.aiter_bytes():
             data.extend(chunk)
             if len(data) > MAX_RESPONSE_BYTES:
+                logger.warning(
+                    "Intent auditor diagnostic: category=%s provider=%s model=%s status_code=%s exception=%s",
+                    "provider_response_validation_failure",
+                    provider,
+                    model,
+                    response.status_code,
+                    "ResponseTooLarge",
+                )
                 raise IntentAuditorUnavailable("Intent assessment response exceeded its limit.")
         return bytes(data)

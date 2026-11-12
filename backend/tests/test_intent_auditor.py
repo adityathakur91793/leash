@@ -1,5 +1,6 @@
 """Focused Phase 5 Intent Auditor contract and fail-closed tests."""
 
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -216,6 +217,265 @@ async def test_deterministic_block_skips_auditor_and_migration_exists(monkeypatc
         assert (await cursor.fetchone())[0] == 0
         cursor = await db.execute("SELECT MAX(version) FROM schema_version")
         assert (await cursor.fetchone())[0] >= 8
+
+
+@pytest.mark.asyncio
+async def test_auditor_client_logs_validation_failure_without_sensitive_data(caplog) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"bad": true}'}}]})
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(IntentAuditorUnavailable):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                await IntentAuditorClient(http)._assess_groq(
+                    IntentAuditorInput.model_validate({
+                        "mandate": {
+                            "currency": "USD", "max_total_budget": "100.00", "max_price_per_item": None,
+                            "max_item_count": 1, "max_quantity_per_item": 1,
+                            "allowed_merchants": ["shop.example"], "allowed_categories": ["books"],
+                            "allow_subscriptions": False, "require_user_approval": False,
+                            "is_active_and_unexpired": True,
+                        },
+                        "proposal": {
+                            "product_name": "Book", "merchant": "shop.example", "category": "books",
+                            "quantity": 1, "unit_price": "10.00", "total": "10.00", "currency": "USD",
+                        },
+                        "deterministic_outcome": "ALLOW",
+                        "policy_rules": [{"rule_id": f"P{i:02d}", "status": "PASS"} for i in range(1, 13)],
+                    })
+                )
+
+    assert any("provider_response_validation_failure" in msg for msg in caplog.messages)
+    assert "sk-secret" not in "\n".join(caplog.messages)
+    assert "Bearer" not in "\n".join(caplog.messages)
+    assert "product_name" not in "\n".join(caplog.messages)
+
+
+@pytest.mark.asyncio
+async def test_auditor_client_logs_http_failure_without_sensitive_data(caplog) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "upstream"})
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(IntentAuditorUnavailable):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                await IntentAuditorClient(http)._assess_groq(
+                    IntentAuditorInput.model_validate({
+                        "mandate": {
+                            "currency": "USD", "max_total_budget": "100.00", "max_price_per_item": None,
+                            "max_item_count": 1, "max_quantity_per_item": 1,
+                            "allowed_merchants": ["shop.example"], "allowed_categories": ["books"],
+                            "allow_subscriptions": False, "require_user_approval": False,
+                            "is_active_and_unexpired": True,
+                        },
+                        "proposal": {
+                            "product_name": "Book", "merchant": "shop.example", "category": "books",
+                            "quantity": 1, "unit_price": "10.00", "total": "10.00", "currency": "USD",
+                        },
+                        "deterministic_outcome": "ALLOW",
+                        "policy_rules": [{"rule_id": f"P{i:02d}", "status": "PASS"} for i in range(1, 13)],
+                    })
+                )
+
+    messages = "\n".join(caplog.messages)
+    assert "provider_http_failure" in messages
+    assert "groq" in messages
+    assert "qwen/qwen3.8-27b" in messages
+    assert "api.groq.com" not in messages
+    assert "Authorization" not in messages
+    assert "Bearer" not in messages
+    assert "shop.example" not in messages
+
+
+@pytest.mark.asyncio
+async def test_assessment_service_logs_stale_and_missing_assessment_categories(caplog, monkeypatch) -> None:
+    from app.services import intent_audit_service as service
+
+    proposal = SimpleNamespace(proposal_id="prp_test", content_hash="x" * 64)
+    mandate = SimpleNamespace(
+        mandate_id="man_test",
+        owner_user_id="owner",
+        status=SimpleNamespace(value="ACTIVE"),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        currency="USD",
+        max_total_budget=Decimal("100.00"),
+        max_price_per_item=None,
+        max_item_count=2,
+        max_quantity_per_item=1,
+        allowed_merchants=["shop.example"],
+        allowed_categories=["books"],
+        allow_subscriptions=False,
+        require_user_approval=False,
+        canonical_payload=lambda: "mandate-canonical-payload",
+    )
+
+    class MissingRowCursor:
+        async def fetchone(self):
+            return None
+
+    class MissingRowConn:
+        async def execute(self, *args, **kwargs):
+            return MissingRowCursor()
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(IntentAuditorUnavailable):
+            await service.require_current_assessment(proposal, mandate, db=MissingRowConn())
+
+    messages = "\n".join(caplog.messages)
+    assert "assessment_missing" in messages
+    assert "shop.example" not in messages
+    assert "Bearer" not in messages
+    assert "product_name" not in messages
+
+    class StaleRowCursor:
+        def __init__(self, row):
+            self.row = row
+
+        async def fetchone(self):
+            return self.row
+
+    class StaleRowConn:
+        def __init__(self, row):
+            self.row = row
+
+        async def execute(self, *args, **kwargs):
+            return StaleRowCursor(self.row)
+
+    current = SimpleNamespace(decision=DecisionOutcome.ALLOW, rules=[])
+    monkeypatch.setattr(service, "current_policy_decision", lambda *args, **kwargs: current)
+
+    stale_row = (
+        "ia_1",
+        "prp_test",
+        "man_test",
+        "VALID",
+        "LOW",
+        '[]',
+        '[]',
+        "x" * 64,
+        "y" * 64,
+        "0" * 64,
+        "P01-P12-v1",
+        "1.0",
+        "intent-auditor-v1",
+        "model",
+        "2024-01-01T00:00:00+00:00",
+        None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(IntentAuditorUnavailable):
+            await service.require_current_assessment(proposal, mandate, db=StaleRowConn(stale_row))
+
+    messages = "\n".join(caplog.messages)
+    assert "assessment_stale" in messages
+    assert "shop.example" not in messages
+    assert "Bearer" not in messages
+
+
+@pytest.mark.asyncio
+async def test_assessment_service_logs_persistence_failure_category(caplog, monkeypatch) -> None:
+    from app.services import intent_audit_service as service
+
+    async def fake_assess(self, payload):
+        return IntentAuditorResult(schema_version="1.0", risk_level="LOW")
+
+    monkeypatch.setattr(service.IntentAuditorClient, "assess", fake_assess)
+
+    async def fake_append_event(*args, **kwargs):
+        raise RuntimeError("db event failure")
+
+    monkeypatch.setattr(service.AuditService, "append_event", fake_append_event)
+
+    async def fake_get_proposal(pid, db=None):
+        return SimpleNamespace(
+            proposal_id=pid,
+            mandate_id="man_persist",
+            content_hash="a" * 64,
+            status=ProposalStatus.SUBMITTED,
+            model_dump=lambda mode=None: {},
+            fingerprint="f" * 64,
+            idempotency_key=None,
+            currency="USD",
+            product_name="Book",
+            merchant="shop.example",
+            category="books",
+            quantity=1,
+            unit_price=Decimal("10.00"),
+            total=Decimal("10.00"),
+        )
+
+    async def fake_get_mandate(mid, db=None):
+        return SimpleNamespace(
+            mandate_id=mid,
+            owner_user_id="owner",
+            currency="USD",
+            max_total_budget=Decimal("100.00"),
+            max_price_per_item=None,
+            max_item_count=2,
+            max_quantity_per_item=1,
+            allowed_merchants=["shop.example"],
+            allowed_categories=["books"],
+            allow_subscriptions=False,
+            require_user_approval=False,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+            status=SimpleNamespace(value="ACTIVE"),
+            canonical_payload=lambda: "mandate",
+        )
+
+    async def fake_current_policy_decision(*args, **kwargs):
+        return SimpleNamespace(
+            decision=DecisionOutcome.ALLOW,
+            rules=[],
+            blocking_rules=[],
+        )
+
+    monkeypatch.setattr(service, "get_proposal", fake_get_proposal)
+    monkeypatch.setattr(service, "get_mandate", fake_get_mandate)
+    monkeypatch.setattr(service, "current_policy_decision", fake_current_policy_decision)
+
+    async def fake_is_kill_switch_active(**kwargs):
+        return False
+
+    monkeypatch.setattr(service, "is_kill_switch_active", fake_is_kill_switch_active)
+
+    def fake_get_connection():
+        class FakeCursor:
+            async def execute(self, *args, **kwargs):
+                return self
+            async def fetchone(self):
+                return None
+            rowcount = 0
+
+        class FakeDB:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def execute(self, *args, **kwargs):
+                return FakeCursor()
+
+            async def commit(self):
+                pass
+
+            async def rollback(self):
+                pass
+
+        return FakeDB()
+
+    monkeypatch.setattr(service, "get_connection", fake_get_connection)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            await service.assess_and_persist("prp_persist", SimpleNamespace(decision=DecisionOutcome.ALLOW, rules=[]))
+
+    messages = "\n".join(caplog.messages)
+    assert "assessment_persistence_failure" in messages
+    assert "prp_persist" in messages
+    assert "shop.example" not in messages
+    assert "Bearer" not in messages
 
 
 async def _active_proposal(

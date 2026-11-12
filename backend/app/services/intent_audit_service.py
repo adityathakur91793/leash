@@ -3,6 +3,7 @@
 import hashlib
 import html
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ from app.services.mandate_service import get_mandate
 from app.services.policy_engine import evaluate_policy
 from app.services.proposal_service import ProposalNotFoundError, get_proposal
 
+logger = logging.getLogger(__name__)
 POLICY_VERSION = "P01-P12-v1"
 _EXCLUDED_EVIDENCE_KEY_PARTS = (
     "secret", "credential", "token", "session", "owner", "user", "email",
@@ -343,7 +345,15 @@ async def assess_and_persist(
                          "finding_codes": [v.value for v in result.finding_codes]}, db=db,
             )
             await db.commit()
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "Intent assessment persistence failure: category=%s proposal_id=%s mandate_id=%s status=%s exception=%s",
+                "assessment_persistence_failure",
+                proposal_id,
+                current_mandate.mandate_id if 'current_mandate' in locals() else None,
+                status.value if 'status' in locals() else None,
+                exc.__class__.__name__,
+            )
             await db.rollback()
             raise
     if blocked_decision is not None:
@@ -369,9 +379,32 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
             "ORDER BY created_at DESC, rowid DESC LIMIT 1", (proposal.proposal_id,)
         )
         row = await cursor.fetchone()
-        if row is None or row[3] != "VALID":
+        if row is None:
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_missing",
+                proposal.proposal_id,
+                None,
+                "MissingAssessmentRow",
+            )
+            raise IntentAuditorUnavailable("A current valid intent assessment is required.")
+        if row[3] != "VALID":
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_stale",
+                proposal.proposal_id,
+                row[3],
+                "AssessmentStatusNotValid",
+            )
             raise IntentAuditorUnavailable("A current valid intent assessment is required.")
         if row[4] == "UNCERTAIN":
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_stale",
+                proposal.proposal_id,
+                row[3],
+                "AssessmentRiskUncertain",
+            )
             raise IntentAuditorUnavailable(
                 "An uncertain intent assessment cannot authorize progression."
             )
@@ -379,6 +412,13 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
         stored_versions = (row[10], row[11], row[12], row[13])
         if (not all(isinstance(version, str) and version for version in stored_versions)
                 or stored_versions != active_versions):
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_stale",
+                proposal.proposal_id,
+                row[3],
+                "AssessmentVersionMismatch",
+            )
             raise IntentAuditorUnavailable("The intent assessment uses stale auditor versions.")
         current = await current_policy_decision(
             proposal, mandate, db=conn, daily_limit=daily_limit,
@@ -390,6 +430,13 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
                 or row[8] != mandate_permissions_hash(mandate)
                 or row[9] != policy_snapshot_hash(current)
                 or current.decision == DecisionOutcome.BLOCK):
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_stale",
+                proposal.proposal_id,
+                row[3],
+                "AssessmentBindingMismatch",
+            )
             raise IntentAuditorUnavailable("The intent assessment is stale.")
         try:
             finding_codes = json.loads(row[5])
@@ -441,6 +488,13 @@ async def require_current_assessment(proposal: Proposal, mandate: Mandate,
                 ).encode("utf-8")
             ).hexdigest()
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                "assessment_malformed",
+                row[1] if isinstance(row, tuple) and len(row) > 1 else None,
+                row[3] if isinstance(row, tuple) and len(row) > 3 else None,
+                exc.__class__.__name__,
+            )
             raise IntentAuditorUnavailable("Persisted intent assessment is invalid.") from exc
         if (require_human_review and proposal.status.value == "APPROVED"
                 and (row[4] in {"MEDIUM", "HIGH"}
@@ -549,6 +603,13 @@ async def get_owner_assessment(
             )
             row = await cursor.fetchone()
             if row is None:
+                logger.warning(
+                    "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                    "assessment_missing",
+                    proposal_id,
+                    None,
+                    "MissingAssessmentRow",
+                )
                 return ProposalIntentAssessmentResponse(
                     proposal_id=proposal_id, assessment=None
                 )
@@ -556,6 +617,13 @@ async def get_owner_assessment(
             record = _assessment_record_from_row(row)
             if (record.status == IntentAssessmentStatus.FAILED
                     and record.risk_level != IntentRiskLevel.UNCERTAIN):
+                logger.warning(
+                    "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                    "assessment_malformed",
+                    proposal_id,
+                    record.status.value,
+                    "InvalidFailedAssessment",
+                )
                 raise AssessmentRetrievalError("Persisted failed assessment data is invalid.")
             try:
                 created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
@@ -571,10 +639,24 @@ async def get_owner_assessment(
                     is_current=current,
                 )
             except ValidationError as exc:
+                logger.warning(
+                    "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                    "assessment_malformed",
+                    proposal_id,
+                    record.status.value,
+                    exc.__class__.__name__,
+                )
                 raise AssessmentRetrievalError(
                     "Persisted assessment data is invalid."
                 ) from exc
             except (AttributeError, TypeError, ValueError, aiosqlite.Error) as exc:
+                logger.warning(
+                    "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                    "assessment_retrieval_failure",
+                    proposal_id,
+                    record.status.value,
+                    exc.__class__.__name__,
+                )
                 raise AssessmentRetrievalError(
                     "Assessment freshness could not be determined safely."
                 ) from exc
@@ -621,24 +703,52 @@ async def get_owner_authorization_snapshot(
             row = await cursor.fetchone()
             public_assessment = None
             if row is not None:
-                record = _assessment_record_from_row(row)
-                if (record.status == IntentAssessmentStatus.FAILED
-                        and record.risk_level != IntentRiskLevel.UNCERTAIN):
-                    raise AssessmentRetrievalError(
-                        "Persisted failed assessment data is invalid."
+                try:
+                    record = _assessment_record_from_row(row)
+                    if (record.status == IntentAssessmentStatus.FAILED
+                            and record.risk_level != IntentRiskLevel.UNCERTAIN):
+                        logger.warning(
+                            "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                            "assessment_malformed",
+                            proposal_id,
+                            record.status.value,
+                            "InvalidFailedAssessment",
+                        )
+                        raise AssessmentRetrievalError(
+                            "Persisted failed assessment data is invalid."
+                        )
+                    created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                    current = await _assessment_is_current(
+                        record, proposal, mandate, db=db, now=now
                     )
-                created_at = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
-                current = await _assessment_is_current(
-                    record, proposal, mandate, db=db, now=now
-                )
-                public_assessment = PublicIntentAssessment(
-                    status=record.status,
-                    risk_level=record.risk_level,
-                    finding_codes=record.finding_codes,
-                    affected_fields=record.affected_fields,
-                    created_at=created_at,
-                    is_current=current,
-                )
+                    public_assessment = PublicIntentAssessment(
+                        status=record.status,
+                        risk_level=record.risk_level,
+                        finding_codes=record.finding_codes,
+                        affected_fields=record.affected_fields,
+                        created_at=created_at,
+                        is_current=current,
+                    )
+                except (AssessmentRetrievalError, ValidationError) as exc:
+                    logger.warning(
+                        "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                        "assessment_retrieval_failure",
+                        proposal_id,
+                        getattr(row, "status", None),
+                        exc.__class__.__name__,
+                    )
+                    raise
+                except (AttributeError, TypeError, ValueError, aiosqlite.Error) as exc:
+                    logger.warning(
+                        "Intent assessment retrieval failure: category=%s proposal_id=%s status=%s exception=%s",
+                        "assessment_retrieval_failure",
+                        proposal_id,
+                        getattr(row, "status", None),
+                        exc.__class__.__name__,
+                    )
+                    raise AssessmentRetrievalError(
+                        "Authorization snapshot data is invalid or unavailable."
+                    ) from exc
 
             result = AuthorizationSnapshotResponse(
                 proposal_id=proposal_id,
