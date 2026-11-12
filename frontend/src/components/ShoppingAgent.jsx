@@ -75,6 +75,9 @@ export function ShoppingAgent({ token, onSessionExpired }) {
     setProposalFeedback(null);
     setError('');
     try {
+      const productSource = product.source === 'LOCAL_SIMULATED_CATALOG'
+        ? `https://catalog.leash.invalid/products/${product.product_id}`
+        : product.source ?? `https://catalog.leash.invalid/products/${product.product_id}`;
       const payload = {
         mandate_id: mandateId,
         product_id: product.product_id,
@@ -87,7 +90,7 @@ export function ShoppingAgent({ token, onSessionExpired }) {
         tax: String(product.tax ?? '0.00'),
         shipping: String(product.shipping ?? '0.00'),
         other_charges: String(product.other_charges ?? '0.00'),
-        product_source: product.source ?? `https://catalog.leash.invalid/products/${product.product_id}`,
+        product_source: productSource,
       };
       const result = await createProposal(token, payload);
       const successMessage = result?.proposal_id

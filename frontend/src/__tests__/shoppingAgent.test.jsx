@@ -67,7 +67,7 @@ describe('ShoppingAgent purchase proposals', () => {
           tax: '0.00',
           shipping: '0.00',
           other_charges: '0.00',
-          product_source: 'LOCAL_SIMULATED_CATALOG',
+          product_source: 'https://catalog.leash.invalid/products/demo_bottle_001',
         });
         return Promise.resolve(response(201, { proposal_id: 'pr_1', status: 'SUBMITTED' }));
       }
